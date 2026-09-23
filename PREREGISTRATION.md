@@ -73,7 +73,10 @@ published studies used?
   level (these levels were emptied, so the last order in their queue was filled), weight =
   contracts, value as in A. A lower bound: sweeps are the largest and most informed orders.
 - Inference: the mean is the ratio of sums over the cell; its standard error is cluster-robust
-  with one cluster per `event_ticker` and the G/(G - 1) correction; t = mean / standard error.
+  with the G/(G - 1) correction; t = mean / standard error. A cluster is a category and a UTC
+  date of market settlement (the trade date when the settlement time is missing), so markets
+  sharing a shock on the same day, such as hourly crypto or index markets, count once
+  (Amendment 1).
 
 ## Cells and decision rule
 
@@ -81,7 +84,8 @@ Cells: category (each category with data, plus all categories pooled) x side x p
 Two tradeable variants: PENNY is decided by B, JOIN by C.
 
 A (variant, cell) pair qualifies if, in the exploration sample and in the confirmation sample
-separately: at least 30 events, at least 500 contracts, mean > 0 and t >= 2. The paper maker
+separately: at least 30 clusters, 100 distinct events and 500 contracts, at least 10 clusters
+whose total is negative (Amendment 1), mean > 0 and t >= 2. The paper maker
 quotes only qualifying pairs. If none qualifies, the conclusion is that a small maker has no
 demonstrated edge on Kalshi's non-sports markets, and the paper maker does not quote.
 
@@ -114,8 +118,24 @@ is used.
   the target is canceled and replaced with a new queue position.
 - Positions are held to settlement. Strategy view: fills in qualifying pairs, at most 100
   contracts per market and variant, 500 USD at risk per event, 5,000 USD in total.
-- Success: pooled strategy-view profit per contract > 0 with event-clustered t >= 2 once 200
-  events have settled. A variant is abandoned if its mean is negative after 30 days.
+- Success: pooled strategy-view profit per contract > 0 with t >= 2 (clusters as in the
+  backtest) once 200 events have settled and at least 10 clusters are negative. A variant is
+  abandoned if its mean is negative after 30 days.
+
+## Amendments
+
+Amendment 1, 23 September 2026, before any trade of the sample was downloaded. A run on
+synthetic data made two weaknesses of the first version visible, and both concern inference
+only:
+
+- Clusters were events. Markets on one underlying settle on the same day across many events
+  (every hourly Bitcoin or index market of a day moves with the same path), so event clusters
+  treat correlated outcomes as independent and overstate t. Clusters are now a category and a
+  settlement date.
+- For contracts far from 0.5, the maker loses rarely and heavily. A cell with few losing
+  clusters has a variance estimate that has not yet seen the tail, and its t is not credible.
+  The usual condition for a normal approximation to a binomial is about ten occurrences of each
+  outcome, hence the floor of 10 negative clusters, together with 100 distinct events.
 
 ## References
 
