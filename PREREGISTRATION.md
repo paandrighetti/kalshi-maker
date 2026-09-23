@@ -191,8 +191,9 @@ independent review:
   in the other. The split now uses `latest_expiration_time`, fixed at listing. The settlement
   date remains the cluster label only.
 - The rule assumes that `latest_expiration_time` is not moved after listing. Kalshi's
-  documentation does not say so; the report shows the share of included markets that settled
-  more than a day after it, which would reveal a moved field.
+  documentation does not say so, and the downloaded data cannot show it, since only the last
+  value is served. The paper maker records the field when it first sees a market and logs any
+  later change, and the forward report counts them: that is the test of the assumption.
 - Markets without a settlement time were excluded by the code of Amendment 2, while this file
   said their trades are clustered on the trade date. The file was right; the code follows it.
 - A failed validity check is re-examined daily for up to 7 days before an invalid gate is
