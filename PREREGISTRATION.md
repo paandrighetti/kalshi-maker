@@ -39,10 +39,11 @@ published studies used?
   the main series, most of the volume); multivariate markets (`mve_collection_ticker` set, or a
   series starting with `KXMVE`); block trades; markets whose `latest_expiration_time` is missing
   or after 2026-09-15 00:00 UTC (Amendment 2); markets whose status is not `finalized` or
-  `settled`, or whose `result` is not `yes` or `no`, when downloaded.
-- Split (Amendment 2): exploration = markets settled before 2026-05-01 00:00 UTC; confirmation =
-  markets settled on or after that time. Every market, and so every outcome, belongs to one
-  period.
+  `settled`, or whose `result` is not `yes` or `no`, when downloaded. A market without a
+  settlement time is kept, and its trades are clustered on their trade date (Amendment 3).
+- Split (Amendment 3): exploration = markets whose `latest_expiration_time` is before
+  2026-05-01 00:00 UTC; confirmation = the others. Every market, and so every outcome, belongs to
+  one period, and the assignment is fixed when the market is listed.
 
 ## Definitions
 
@@ -105,8 +106,9 @@ of the estimate to the sampling of trades, not to new outcomes.
 Data validity (Amendment 2): no gate is written, and no conclusion is drawn, if more than 2 % of
 the sampled hours returned no trade, if more than 5 % of the downloaded trades have no market
 record, if more than 1 % of the trades of eligible markets belong to markets not final at
-download, or if either period has no data. The gate then says why, and the paper maker does not
-quote.
+download, or if either period has no data. A failed check is examined again every day, after
+downloading the empty hours and the non-final markets again, for up to 7 days; only then is an
+invalid gate written, which says why, and the paper maker does not quote (Amendment 3).
 
 The gate is written once. A later run never overwrites it.
 
@@ -178,6 +180,24 @@ independent review of the code:
   had room for an improved quote, while PENNY joins the best price when the spread is one tick;
   the forward universe is the 400 most active markets closing within 7 days, while the cells
   pool all horizons.
+
+Amendment 3, 23 September 2026, before any trade of the sample was downloaded, after a second
+independent review:
+
+- The period split of Amendment 2, by settlement date, depended on the outcome: a market that
+  can close early settles when the event happens, so an early YES fell in the exploration
+  period and a NO reached at the deadline in the confirmation period. On fairly priced synthetic
+  markets that split alone gave a maker selling YES -50 cents per contract in one period and +26
+  in the other. The split now uses `latest_expiration_time`, fixed at listing. The settlement
+  date remains the cluster label only.
+- The rule assumes that `latest_expiration_time` is not moved after listing. Kalshi's
+  documentation does not say so; the report shows the share of included markets that settled
+  more than a day after it, which would reveal a moved field.
+- Markets without a settlement time were excluded by the code of Amendment 2, while this file
+  said their trades are clustered on the trade date. The file was right; the code follows it.
+- A failed validity check is re-examined daily for up to 7 days before an invalid gate is
+  written, since the causes it detects (markets not yet final, an API fault that emptied an
+  hour) are often temporary.
 
 ## References
 
