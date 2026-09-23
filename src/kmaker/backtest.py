@@ -81,14 +81,20 @@ def build_tables(con: duckdb.DuckDBPyConnection, data_dir: Path, residue: int) -
     con.execute(
         f"CREATE OR REPLACE TABLE sr AS SELECT * FROM read_parquet('{data_dir}/series.parquet')"
     )
-    # the latest record of each market: parts are numbered, a later part supersedes
+    # the latest record of each market: parts are numbered and a later part supersedes. The
+    # latest part per ticker comes from a plain aggregation, then the record from a join, both
+    # of which spill to disk; max_by would skip NULL fields and mix records of different parts
+    rec = (
+        "SELECT *, regexp_extract(filename, '(part-[0-9]+)[.]parquet$', 1) AS part "
+        f"FROM read_parquet('{data_dir}/markets/*.parquet', filename = true)"
+    )
+    con.execute(
+        f"CREATE OR REPLACE TABLE lp AS SELECT ticker, max(part) AS part FROM ({rec}) GROUP BY 1"
+    )
     con.execute(
         f"""
         CREATE OR REPLACE TABLE mk0 AS
-        SELECT * EXCLUDE (filename),
-               regexp_extract(filename, '(part-[0-9]+)[.]parquet$', 1) AS part
-        FROM read_parquet('{data_dir}/markets/*.parquet', filename = true)
-        QUALIFY row_number() OVER (PARTITION BY ticker ORDER BY filename DESC) = 1
+        SELECT r.* EXCLUDE (filename) FROM ({rec}) r JOIN lp USING (ticker, part)
         """
     )
     con.execute(

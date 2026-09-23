@@ -135,8 +135,13 @@ class Kalshi:
         path = "/historical/trades" if historical else "/markets/trades"
         return self.paginate(path, {"min_ts": min_ts, "max_ts": max_ts, "limit": 1000}, "trades")
 
-    def recent_trade_pages(self, min_ts: int) -> Iterator[list[dict[str, Any]]]:
-        return self.pages("/markets/trades", {"min_ts": min_ts, "limit": 1000}, "trades")
+    def recent_trade_pages(
+        self, min_ts: int, max_ts: int | None = None
+    ) -> Iterator[list[dict[str, Any]]]:
+        params: dict[str, Any] = {"min_ts": min_ts, "limit": 1000}
+        if max_ts is not None:
+            params["max_ts"] = max_ts
+        return self.pages("/markets/trades", params, "trades")
 
     def markets_by_tickers(self, tickers: Sequence[str], historical: bool) -> list[dict[str, Any]]:
         if not tickers:

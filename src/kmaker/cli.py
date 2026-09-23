@@ -1,8 +1,8 @@
 """Command line: `kmaker pipeline | backtest | paper | report`.
 
-`pipeline` is what the one-shot container runs: download the primary sample, decide, report,
-then download the holdout hours and add them to the report. Every step is resumable, so a
-restart after a crash or a reboot continues where it stopped.
+`pipeline` is what the backtest container runs: download the primary sample, decide, report,
+then download the holdout hours and add them to the report, then idle. Every step is
+resumable, so a restart after a crash or a reboot continues where it stopped.
 """
 
 from __future__ import annotations
@@ -86,8 +86,27 @@ def _download(s: Settings, c: Kalshi, residue: int) -> None:
 def _first_attempt(data_dir: Path) -> float:
     path = data_dir / "first_decision_attempt.txt"
     if not path.exists():
-        path.write_text(f"{time.time():.0f}")
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(f"{time.time():.0f}")
+        tmp.replace(path)
     return float(path.read_text())
+
+
+def _outside_other_reports(now: datetime | None = None) -> float:
+    """Seconds to wait so that the DuckDB phase avoids 05:30 to 07:30 UTC, when updown-desk's
+    reporter (up to 3 GB) runs on the same 4 GB host."""
+    now = now or datetime.now(timezone.utc)
+    start = now.replace(hour=5, minute=30, second=0, microsecond=0)
+    end = now.replace(hour=7, minute=30, second=0, microsecond=0)
+    return (end - now).total_seconds() if start <= now < end else 0.0
+
+
+def _backtest(s: Settings, residue: int, write_gate: bool, final_attempt: bool) -> dict:
+    wait = _outside_other_reports()
+    if wait:
+        log.info("waiting %.0f s for updown-desk's daily report to finish", wait)
+        time.sleep(wait)
+    return backtest.run(s.data_dir, s.reports_dir, residue, write_gate, final_attempt)
 
 
 def cmd_pipeline(s: Settings, holdout: bool, retry_wait_s: float = 86400.0) -> None:
@@ -106,7 +125,7 @@ def cmd_pipeline(s: Settings, holdout: bool, retry_wait_s: float = 86400.0) -> N
             _download(s, c, primary)
             first = first or _first_attempt(s.data_dir)
             final = time.time() - first >= 6 * 86400
-            summary = backtest.run(s.data_dir, s.reports_dir, primary, True, final_attempt=final)
+            summary = _backtest(s, primary, True, final)
             _write(s.reports_dir / "BACKTEST.md", report.backtest_report(s.reports_dir, s.data_dir))
             if summary["gate_written"]:
                 gate = json.loads(gate_path.read_text())
@@ -122,13 +141,62 @@ def cmd_pipeline(s: Settings, holdout: bool, retry_wait_s: float = 86400.0) -> N
         label = f"r{PREREG.holdout_residue}"
         if holdout and not (s.reports_dir / "backtest" / label / "summary.json").exists():
             _download(s, c, PREREG.holdout_residue)
-            backtest.run(s.data_dir, s.reports_dir, PREREG.holdout_residue, False)
+            _backtest(s, PREREG.holdout_residue, False, True)
             _write(s.reports_dir / "BACKTEST.md", report.backtest_report(s.reports_dir, s.data_dir))
             telegram.send(
                 s.telegram_token,
                 s.telegram_chat,
                 "kalshi-maker: holdout hours added to BACKTEST.md",
             )
+
+
+def pipeline_forever(s: Settings, holdout: bool) -> None:
+    """Run the pipeline to completion, then idle; never exit.
+
+    The container restarts only after a reboot or a Docker restart, and then resumes. A
+    failure is reported on Telegram and retried after 30 minutes; after four failures in a day
+    the pipeline waits a day before trying again, with a message each time.
+    """
+    failures: list[float] = []
+    while True:
+        try:
+            cmd_pipeline(s, holdout)
+            break
+        except Exception as exc:
+            log.exception("pipeline failed")
+            now = time.time()
+            failures = [t for t in failures if t > now - 86400] + [now]
+            wait = 86400 if len(failures) >= 4 else 1800
+            telegram.send(
+                s.telegram_token,
+                s.telegram_chat,
+                f"kalshi-maker pipeline failed ({type(exc).__name__}: {exc}); "
+                f"{len(failures)} failure(s) in 24 h, next attempt in {wait // 60:.0f} min",
+            )
+            time.sleep(wait)
+    log.info("pipeline complete, idle")
+    while True:
+        time.sleep(86400)
+
+
+def _pending_digest(s: Settings) -> str:
+    """Daily message while there is no gate: where the download stands."""
+    hours = ingest.sampled_hours(
+        PREREG.window_start, PREREG.window_end, PREREG.hour_mod, PREREG.primary_residue
+    )
+    done = ingest.hour_counts(s.data_dir, PREREG.primary_residue)
+    path = s.data_dir / f"hours_r{PREREG.primary_residue}.json"
+    age = (time.time() - path.stat().st_mtime) / 3600 if path.exists() else float("nan")
+    lines = [
+        f"kalshi-maker: no gate yet; {len(done)} of {len(hours)} sampled hours downloaded, "
+        f"last progress {age:.1f} h ago"
+    ]
+    summary = s.reports_dir / "backtest" / "primary" / "summary.json"
+    if summary.exists():
+        reasons = json.loads(summary.read_text()).get("validity", {}).get("reasons", [])
+        if reasons:
+            lines.append("data checks failed: " + "; ".join(reasons))
+    return "\n".join(lines)
 
 
 def _series_map(s: Settings, c: Kalshi) -> dict:
@@ -157,7 +225,7 @@ def cmd_paper(s: Settings) -> None:
 def cmd_report(s: Settings, loop: bool, hour: int) -> None:
     def once() -> None:
         if not (s.data_dir / "gate.json").exists():
-            log.info("no gate yet, no forward report")
+            telegram.send(s.telegram_token, s.telegram_chat, _pending_digest(s))
             return
         text, digest = report.forward_report(s.data_dir)
         day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -185,7 +253,9 @@ def main(argv: list[str] | None = None) -> None:
     sub = p.add_subparsers(dest="cmd", required=True)
     pp = sub.add_parser("pipeline", help="download the sample, decide, report")
     pp.add_argument("--no-holdout", action="store_true")
-    bt = sub.add_parser("backtest", help="recompute statistics from downloaded data")
+    bt = sub.add_parser(
+        "backtest", help="recompute statistics from downloaded data (never writes the gate)"
+    )
     bt.add_argument("--residue", type=int, default=PREREG.primary_residue)
     sub.add_parser("paper", help="run the forward paper maker")
     rp = sub.add_parser("report", help="forward report now, or daily with --loop")
@@ -195,19 +265,10 @@ def main(argv: list[str] | None = None) -> None:
     s = Settings()
     logging.basicConfig(level=s.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     if args.cmd == "pipeline":
-        try:
-            cmd_pipeline(s, holdout=not args.no_holdout)
-        except Exception as exc:
-            telegram.send(s.telegram_token, s.telegram_chat, f"kalshi-maker pipeline failed: {exc}")
-            raise
+        pipeline_forever(s, holdout=not args.no_holdout)
     elif args.cmd == "backtest":
-        backtest.run(
-            s.data_dir,
-            s.reports_dir,
-            args.residue,
-            write_gate=args.residue == PREREG.primary_residue,
-        )
-        _write(s.reports_dir / "BACKTEST.md", report.backtest_report(s.reports_dir, s.data_dir))
+        # by hand: statistics only; the gate belongs to the pipeline and its schedule
+        backtest.run(s.data_dir, s.reports_dir, args.residue, write_gate=False)
     elif args.cmd == "paper":
         cmd_paper(s)
     elif args.cmd == "report":

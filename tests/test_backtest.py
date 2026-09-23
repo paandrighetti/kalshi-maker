@@ -379,3 +379,18 @@ def test_sql_cells_match_the_pandas_reference(planted):
     for col in ("clusters", "events", "losing", "contracts", "rows", "mean_c", "se_c"):
         assert np.allclose(m[col], m[f"{col}_ref"], equal_nan=True), col
     assert np.allclose(m["t"], m["t_ref"], equal_nan=True)
+
+
+def test_a_later_market_part_supersedes_the_whole_record(tmp_path):
+    t = us("2026-01-05T12:00:00")
+    trades = [("KXM-E1-A", "t1", 1.0, 0.30, True, t, False)]
+    first = market("KXM-E1-A", "KXM-E1", "KXM", "yes")
+    d = write_dir(tmp_path, [first], trades)
+    # a later part re-fetched the market: a NULL there must not be filled from the older part
+    later = market("KXM-E1-A", "KXM-E1", "KXM", "no", settlement_us=None)
+    write_rows([later], MARKET_SCHEMA, d / "markets" / "part-00001.parquet")
+    write_rows([], RANGE_SCHEMA, d / "ranges" / "part-00001.parquet")
+    con = backtest.connect(d / "work.duckdb")
+    backtest.build_tables(con, d, 0)
+    got = con.execute("SELECT result, settlement_us, part FROM mk0").fetchall()
+    assert got == [("no", None, "part-00001")]

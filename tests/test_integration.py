@@ -133,6 +133,7 @@ def pipeline_env(tmp_path, monkeypatch):
         )
 
     monkeypatch.setattr(cli, "_client", fake_client)
+    monkeypatch.setattr(cli, "_outside_other_reports", lambda now=None: 0.0)
     return api, tmp_path / "data", tmp_path / "reports"
 
 
@@ -169,6 +170,8 @@ class FakeLive:
         self.tape = []
         self.result, self.status = "", "active"
         self.fail_trades = False
+        self.windows = []
+        self.fail_after = None
 
     def _market(self, ticker="KXM-E1-A"):
         return {
@@ -196,8 +199,11 @@ class FakeLive:
         self.requests += 1
         return [self._market(t) for t in tickers if t == "KXM-E1-A"]
 
-    def recent_trade_pages(self, min_ts):
+    def recent_trade_pages(self, min_ts, max_ts=None):
         self.requests += 1
+        self.windows.append((min_ts, max_ts))
+        if self.fail_after is not None and len(self.windows) > self.fail_after:
+            raise RuntimeError("slice failed")
         if self.fail_trades:
 
             def broken():
@@ -372,3 +378,92 @@ def test_no_data_writes_an_invalid_gate_only_on_the_final_attempt(tmp_path):
     s = backtest.run(d, r, 0, write_gate=True, final_attempt=True)
     gate = json.loads((d / "gate.json").read_text())
     assert not gate["valid"] and gate["invalid_reasons"] == ["no market record was downloaded"]
+
+
+def test_catch_up_reads_the_backlog_in_slices_and_keeps_completed_ones(tmp_path, monkeypatch):
+    gate = {
+        "generated_at": "x",
+        "valid": True,
+        "qualifying": [
+            {"variant": "PENNY", "category": "Mentions", "side": "short_yes", "bucket": 1}
+        ],
+    }
+    monkeypatch.setenv("KM_DATA_DIR", str(tmp_path))
+    fake = FakeLive()
+    pm = PaperMaker(Settings(), fake, gate, {"KXM": ("Mentions", "quadratic", 1.0)})
+    t0 = time.time() - 1500  # 25 minutes of backlog: slices of 10, 10 and 5 minutes
+    pm.last_trade_poll = t0
+    fake.fail_after = 1  # the second slice fails
+    with pytest.raises(RuntimeError):
+        pm.poll_trades()
+    assert pm.last_trade_poll == t0 + 600  # the first slice is kept
+    fake.fail_after, fake.windows = None, []
+    pm.poll_trades()
+    (a, b), (c, d) = fake.windows
+    assert (a, b) == (int(t0 + 600) - 30, int(t0 + 1200) + 1) and d is None
+    assert c == int(t0 + 1200) - 30 and pm.last_trade_poll > t0 + 1200
+
+
+def test_latest_expiration_changes_are_logged(tmp_path, monkeypatch):
+    gate = {
+        "generated_at": "x",
+        "valid": True,
+        "qualifying": [
+            {"variant": "PENNY", "category": "Mentions", "side": "short_yes", "bucket": 1}
+        ],
+    }
+    monkeypatch.setenv("KM_DATA_DIR", str(tmp_path))
+    fake = FakeLive()
+    pm = PaperMaker(Settings(), fake, gate, {"KXM": ("Mentions", "quadratic", 1.0)})
+    orig = fake._market
+
+    def with_latest(ticker="KXM-E1-A", latest=fake.now + 5 * 86400):
+        return {**orig(ticker), "latest_expiration_time": iso(latest)}
+
+    fake._market = with_latest
+    pm.cycle()
+    assert pm.db.execute("SELECT count(*) FROM field_changes").fetchone()[0] == 0
+    fake._market = lambda ticker="KXM-E1-A": with_latest(ticker, fake.now + 9 * 86400)
+    pm.cycle()
+    rows = pm.db.execute("SELECT ticker, field FROM field_changes").fetchall()
+    assert rows == [("KXM-E1-A", "latest_expiration_time")]
+
+
+def test_the_backtest_waits_out_the_other_daily_report():
+    day = datetime(2026, 9, 24, tzinfo=timezone.utc)
+    assert cli._outside_other_reports(day.replace(hour=5, minute=29)) == 0
+    assert cli._outside_other_reports(day.replace(hour=6, minute=0)) == 5400
+    assert cli._outside_other_reports(day.replace(hour=7, minute=30)) == 0
+
+
+def test_pending_digest_reports_progress(pipeline_env):
+    api, data_dir, reports_dir = pipeline_env
+    data_dir.mkdir(parents=True)
+    (data_dir / "hours_r0.json").write_text(json.dumps({"2026-01-01T00": 5}))
+    text = cli._pending_digest(Settings())
+    assert "no gate yet; 1 of" in text and "last progress" in text
+
+
+def test_pipeline_forever_retries_failures_then_idles(monkeypatch):
+    runs, sleeps, sent = [], [], []
+
+    def flaky(s, holdout):
+        runs.append(1)
+        if len(runs) < 3:
+            raise RuntimeError("boom")
+
+    class Stop(Exception):
+        pass
+
+    def fake_sleep(sec):
+        sleeps.append(sec)
+        if len(runs) >= 3 and sec == 86400:  # the idle loop after completion
+            raise Stop
+
+    monkeypatch.setattr(cli, "cmd_pipeline", flaky)
+    monkeypatch.setattr(cli.time, "sleep", fake_sleep)
+    monkeypatch.setattr(cli.telegram, "send", lambda t, c, text: sent.append(text))
+    with pytest.raises(Stop):
+        cli.pipeline_forever(Settings(), holdout=False)
+    assert len(runs) == 3 and sleeps[:2] == [1800, 1800]
+    assert len(sent) == 2 and "failed (RuntimeError: boom)" in sent[0]

@@ -53,6 +53,7 @@ TRADE_OVERLAP_S = 30
 SCAN_BATCH = 200
 LISTING_PAGES_PER_CYCLE = 5
 TAPE_WATCHDOG_S = 120
+CATCH_UP_SLICE_S = 600
 
 
 @dataclass
@@ -65,6 +66,7 @@ class MarketInfo:
     expiry_us: int
     volume_24h: float = 0.0
     two_sided: bool = False
+    latest_us: int | None = None  # latest_expiration_time when first seen, to detect a move
 
 
 @dataclass
@@ -275,6 +277,9 @@ CREATE TABLE IF NOT EXISTS cycles (
     taker_orders INTEGER, fills INTEGER, requests INTEGER, trade_lag_s REAL, errors TEXT
 );
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE IF NOT EXISTS field_changes (
+    ticker TEXT, field TEXT, old INTEGER, new INTEGER, seen_us INTEGER
+);
 """
 
 
@@ -381,6 +386,7 @@ class PaperMaker:
             expiry,
             float(m.get("volume_24h_fp") or 0.0),
             top_of_book(m) is not None,
+            nm["latest_expiration_us"],
         )
 
     def listing_step(self) -> None:
@@ -466,32 +472,43 @@ class PaperMaker:
         self.seen_set.add(tid)
 
     def poll_trades(self) -> tuple[int, int]:
-        """Apply the tape since the last complete poll, one page at a time.
+        """Apply the tape since the last complete poll, oldest slice first.
 
-        A trade on a quoted market is applied once: its id is remembered. A page that fails
-        leaves `last_trade_poll` where it was, so the next poll reads the same window again and
-        skips what was applied. Fills are written page by page, so memory stays bounded after a
-        long outage. Returns the numbers of taker orders and fills.
+        The window since the last complete poll is read in slices of ten minutes; each slice is
+        applied page by page and moves the window forward once complete, so a failure repeats
+        one slice, not the whole backlog of an outage. A trade on a quoted market is applied
+        once: its id is remembered, and a slice holds far fewer ids than the memory keeps.
+        Returns the numbers of taker orders and fills.
         """
         started = time.time()
         n_orders = n_fills = newest = 0
-        for page in self.client.recent_trade_pages(int(self.last_trade_poll) - TRADE_OVERLAP_S):
-            rows = []
-            for t in page:
-                row = normalize_trade(t)
-                if row is None:
-                    continue
-                newest = max(newest, row[5])
-                if row[0] in self.sim.orders and row[1] not in self.seen_set:
-                    self._remember(row[1])
-                    rows.append(row)
-            orders = group_taker_orders(rows)
-            fills = [f for o in orders for f in self.sim.on_taker_order(o)]
-            write_fills(self.db, fills, self.known, self.run_id)
-            n_orders, n_fills = n_orders + len(orders), n_fills + len(fills)
+        start = self.last_trade_poll
+        while True:
+            end = min(started, start + CATCH_UP_SLICE_S)
+            last = end >= started
+            pages = self.client.recent_trade_pages(
+                int(start) - TRADE_OVERLAP_S, None if last else int(end) + 1
+            )
+            for page in pages:
+                rows = []
+                for t in page:
+                    row = normalize_trade(t)
+                    if row is None:
+                        continue
+                    newest = max(newest, row[5])
+                    if row[0] in self.sim.orders and row[1] not in self.seen_set:
+                        self._remember(row[1])
+                        rows.append(row)
+                orders = group_taker_orders(rows)
+                fills = [f for o in orders for f in self.sim.on_taker_order(o)]
+                write_fills(self.db, fills, self.known, self.run_id)
+                n_orders, n_fills = n_orders + len(orders), n_fills + len(fills)
+            self.last_trade_poll = end
+            if last:
+                break
+            start = end
         if newest:
             self.trade_lag_s = started - newest / 1e6
-        self.last_trade_poll = started
         self.last_tape_ok = time.time()
         return n_orders, n_fills
 
@@ -513,23 +530,38 @@ class PaperMaker:
                     m["ticker"]: m for m in self.client.markets_by_tickers(batch, historical=False)
                 }
             except Exception:
-                log.exception("book refresh failed; quotes of this batch are pulled")
+                # the books cannot be read: pull every quote rather than leave them stale
+                log.exception("book refresh failed; every quote is pulled for this cycle")
                 cancel_at = int(time.time() * 1e6) + self.delay_us
-                for t in batch:
+                for t in list(self.sim.orders):
                     self.sim.cancel_all(t, cancel_at)
-                continue
+                raise
             recv_us = int(time.time() * 1e6)
             for t in batch:
                 info, m = self.candidates.get(t), got.get(t)
                 if info is None or m is None or m.get("status") not in ("active", "open"):
                     self.sim.cancel_all(t, recv_us + self.delay_us)
                     continue
+                self._check_latest(info, m, recv_us)
                 book = top_of_book(m)
                 info.two_sided = book is not None
                 info.volume_24h = float(m.get("volume_24h_fp") or info.volume_24h)
                 self.known[t] = info
                 fills += self.sim.on_book(info, book, recv_us, self.delay_us)
         return fills
+
+    def _check_latest(self, info: MarketInfo, m: dict, now_us: int) -> None:
+        """Log a change of `latest_expiration_time` after listing (PREREGISTRATION, Amendment 3)."""
+        new = ts_us(m.get("latest_expiration_time"))
+        if new is None:
+            return
+        if info.latest_us is not None and new != info.latest_us:
+            self.db.execute(
+                "INSERT INTO field_changes VALUES (?,?,?,?,?)",
+                (info.ticker, "latest_expiration_time", info.latest_us, new, now_us),
+            )
+            self.db.commit()
+        info.latest_us = new
 
     def check_settlements(self) -> None:
         """Record results of markets with fills once final; many close before expected."""

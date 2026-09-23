@@ -27,7 +27,7 @@ printed in every report and stored in `data/gate.json`; the constants it names l
 ## What runs
 
 ```
-backtest (one shot, resumable)
+backtest (resumable; idles when done, resumes after a reboot)
   ingest    /series, then every trade of the sampled hours (one UTC hour in twelve, chosen by
             hash) from /historical/trades or /markets/trades around Kalshi's cutoff, sports
             series dropped on write, then the markets of those trades
@@ -74,12 +74,19 @@ docker compose logs -f backtest   # progress of the download, then the verdict
 
 `KM_RATE` (download, 6 requests per second) and `KM_RATE_PAPER` (paper maker, 4) keep the two
 well under Kalshi's basic limit of about 20 per second together. The backtest's DuckDB work
-file needs about 1 GB plus 130 bytes per downloaded trade of free disk (measured: 36 million
-synthetic trades in 137 s, 943 MB of memory, 3.7 GB of disk); the download stops below 3 GB.
+file needs about 1 GB plus 130 bytes per downloaded trade of free disk; the download stops
+below 3 GB.
 Transient API failures are retried for about an hour inside the pipeline; if the data checks
 fail, the missing parts are downloaded again every day for up to 6 days before the gate is
-written as invalid. A failed pipeline sends a Telegram message and is restarted at most three
-times; every step resumes where it stopped.
+written as invalid. A failed pipeline sends a Telegram message and tries again 30 minutes later
+(a day later after four failures in a day); it never exits, so after a reboot Docker restarts it
+and it resumes. Its DuckDB phase waits out 05:30 to 07:30 UTC, when updown-desk's reporter uses
+most of the host's memory. The reporter sends a daily digest: download progress while there is
+no gate, forward results and operating health afterwards.
+
+Measured on synthetic samples in the exact on-disk format: 36 million trades on 1.2 million
+markets in 137 s with 943 MB of memory and 3.7 GB of scratch disk; 20 million trades on
+2 million markets in 82 to 92 s with at most 923 MB, four runs out of four.
 
 Without Docker: `pip install -e .[dev]`, then `kmaker pipeline`, `kmaker paper`,
 `kmaker report`, and `pytest -q`. `KM_DATA_DIR` and `KM_REPORTS_DIR` default to `data/` and

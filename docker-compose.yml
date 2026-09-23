@@ -1,6 +1,6 @@
 # Three services, all reading and writing ./data and ./reports.
 # backtest: downloads the pre-registered sample, writes data/gate.json and reports/BACKTEST.md,
-#           then the holdout hours; exits when done (restarted only on failure, resumable).
+#           then the holdout hours, then idles; after a reboot it resumes where it stopped.
 # paper:    waits for the gate, then quotes the qualifying cells virtually, around the clock.
 # reporter: forward report and Telegram digest every day at 07:00 UTC.
 services:
@@ -8,8 +8,8 @@ services:
     build: .
     env_file: .env
     command: ["kmaker", "pipeline"]
-    restart: on-failure:3
-    mem_limit: 1200m
+    restart: unless-stopped
+    mem_limit: 1400m
     volumes:
       - ./data:/data
       - ./reports:/reports

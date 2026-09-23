@@ -180,9 +180,12 @@ def load_forward(db_path: Path) -> tuple[pd.DataFrame, pd.DataFrame, dict | None
     cycles = pd.read_sql_query("SELECT * FROM cycles", db)
     settle = pd.read_sql_query("SELECT ticker, result, settled_us FROM settlements", db)
     meta = dict(db.execute("SELECT k, v FROM meta").fetchall())
+    moved = db.execute("SELECT count(DISTINCT ticker) FROM field_changes").fetchone()[0]
     db.close()
     fills = fills.merge(settle, on="ticker", how="left")
     traded_gate = json.loads(meta["gate"]) if "gate" in meta else None
+    if traded_gate is not None:
+        traded_gate["_moved_latest_expiration"] = int(moved)
     return fills, cycles, traded_gate
 
 
@@ -267,6 +270,21 @@ def forward_status(settled: pd.DataFrame, first_fill_us: int, now_us: int) -> st
     return f"running, day {days:.0f} of the forward test"
 
 
+def _health(cycles: pd.DataFrame, traded_gate: dict | None) -> str:
+    """Operating state for the digest: failed stages, last cycle, moved listing fields."""
+    moved = (traded_gate or {}).get("_moved_latest_expiration", 0)
+    if cycles.empty:
+        return f"no cycle recorded yet; markets with a moved latest expiration: {moved}"
+    now_us = datetime.now(timezone.utc).timestamp() * 1e6
+    day = cycles[cycles["ts_us"] > now_us - 86_400e6]
+    failed = int((day["errors"].fillna("") != "").sum())
+    last_min = (now_us - cycles["ts_us"].max()) / 60e6
+    return (
+        f"last cycle {last_min:.0f} min ago; {failed} of {len(day)} cycles in 24 h with a failed "
+        f"stage; markets with a moved latest expiration: {moved}"
+    )
+
+
 def _idle_reason(gate: dict) -> str | None:
     if not gate.get("valid", True):
         return "the data failed the validity checks (" + "; ".join(gate["invalid_reasons"]) + ")"
@@ -297,6 +315,7 @@ def forward_report(data_dir: Path) -> tuple[str, str]:
         text = "\n".join(head + ["The paper maker has not started yet."]) + "\n"
         return text, "kalshi-maker: the paper maker has not started yet."
     fills, cycles, traded_gate = load_forward(db_path)
+    health = _health(cycles, traded_gate)
     if traded_gate is not None and traded_gate.get("generated_at") != gate["generated_at"]:
         head += [
             "Warning: gate.json differs from the gate the paper maker trades; the report "
@@ -305,12 +324,12 @@ def forward_report(data_dir: Path) -> tuple[str, str]:
         ]
         gate = traded_gate
     if fills.empty:
-        text = "\n".join(head + ["No fill yet."]) + "\n"
-        return text, "kalshi-maker: running, no fill yet."
+        text = "\n".join(head + ["No fill yet.", "", health]) + "\n"
+        return text, "kalshi-maker: running, no fill yet.\n" + health
     f = with_pnl(fills)
     now_us = int(now.timestamp() * 1e6)
     out = list(head)
-    digest = ["kalshi-maker forward"]
+    digest = ["kalshi-maker forward", health]
     for variant in sorted(f["variant"].unique()):
         fv = f[f["variant"] == variant]
         sv = strategy_view(fv, gate["qualifying"])
