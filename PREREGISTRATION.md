@@ -165,8 +165,10 @@ independent review of the code:
   not independent.
 - Data validity checks and the write-once gate, so that missing data cannot be reported as the
   absence of an edge, and a restart cannot change the gate the paper maker trades.
-- Ticks below a price and fees: a quote one tick below an ask of 0.90 on a tapered grid is
-  0.899 (step 0.001 below 0.90), not 0.89; only `quadratic_with_maker_fees` charges makers
+- Ticks below a price and fees: on a tapered grid (steps of 0.001 below 0.10 and above 0.90,
+  0.01 between), one tick below an ask of 0.10 is 0.099 and one tick below an ask of 0.90 is
+  0.89; the first version used the step at the price itself and got 0.09 and 0.899, the second
+  of which is not a valid price. Only `quadratic_with_maker_fees` charges makers
   (`quadratic_with_combo_maker_fees` concerns multivariate markets, which are excluded).
 - Forward test: cancels wait one second like new quotes, a slow maker cannot pull a quote
   faster than it posts one; the universe uses the earlier of close and expected expiration,
