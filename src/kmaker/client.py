@@ -19,7 +19,11 @@ log = logging.getLogger(__name__)
 
 
 class KalshiError(RuntimeError):
-    pass
+    """A request that failed after its retries (transport errors, 429, 5xx)."""
+
+
+class KalshiClientError(KalshiError):
+    """A 4xx other than 429: the request itself is wrong, retrying cannot help."""
 
 
 class Kalshi:
@@ -81,7 +85,7 @@ class Kalshi:
                 if r.status_code == 429 or r.status_code >= 500:
                     last = KalshiError(f"HTTP {r.status_code} on {path}")
                 else:
-                    raise KalshiError(f"HTTP {r.status_code} on {path}: {r.text[:300]}")
+                    raise KalshiClientError(f"HTTP {r.status_code} on {path}: {r.text[:300]}")
             self._sleep(delay)
             delay = min(delay * 2.0, 30.0)
         raise KalshiError(f"giving up on {path} after {self._max_tries} tries: {last}")
@@ -124,15 +128,15 @@ class Kalshi:
     def series_one(self, ticker: str) -> dict[str, Any] | None:
         try:
             return self.get(f"/series/{ticker}").get("series")
-        except KalshiError:
+        except KalshiClientError:
             return None
 
     def trades(self, min_ts: int, max_ts: int, historical: bool) -> Iterator[dict[str, Any]]:
         path = "/historical/trades" if historical else "/markets/trades"
         return self.paginate(path, {"min_ts": min_ts, "max_ts": max_ts, "limit": 1000}, "trades")
 
-    def recent_trades(self, min_ts: int) -> Iterator[dict[str, Any]]:
-        return self.paginate("/markets/trades", {"min_ts": min_ts, "limit": 1000}, "trades")
+    def recent_trade_pages(self, min_ts: int) -> Iterator[list[dict[str, Any]]]:
+        return self.pages("/markets/trades", {"min_ts": min_ts, "limit": 1000}, "trades")
 
     def markets_by_tickers(self, tickers: Sequence[str], historical: bool) -> list[dict[str, Any]]:
         if not tickers:

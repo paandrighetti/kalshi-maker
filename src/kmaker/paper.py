@@ -10,9 +10,12 @@ and the latency are those of PREREGISTRATION.md, section "Forward test": a new q
 both take effect one second after the book they were decided on.
 
 Failure handling. Each stage of a cycle fails on its own: a failed market listing does not stop
-trade polling or quoting. Trade ids are marked as seen only once a whole poll succeeded, and fills
-are written as soon as they exist, so an API error never loses a fill. If the tape cannot be read
-for two minutes, every quote is canceled, as a real maker's watchdog would do.
+trade polling or quoting. The tape is applied page by page with trade ids remembered, and the
+polling window only moves forward after a complete poll, so a failed page is read again and
+nothing is applied twice; fills are written as soon as they exist, and a canceled quote is kept
+until a complete poll has read the tape past its cancel. If the tape cannot be read for two
+minutes, every quote is canceled and none is posted, as a real maker's watchdog would do; the
+client used here fails fast (two tries, ten-second timeout) so that the watchdog can act.
 """
 
 from __future__ import annotations
@@ -456,30 +459,50 @@ class PaperMaker:
 
     # cycle ------------------------------------------------------------------------------
 
-    def poll_trades(self) -> list[TakerOrder]:
-        """New taker orders on quoted markets. Nothing is marked seen unless the poll succeeds."""
+    def _remember(self, tid: str) -> None:
+        if len(self.seen_ids) == self.seen_ids.maxlen:
+            self.seen_set.discard(self.seen_ids[0])
+        self.seen_ids.append(tid)
+        self.seen_set.add(tid)
+
+    def poll_trades(self) -> tuple[int, int]:
+        """Apply the tape since the last complete poll, one page at a time.
+
+        A trade on a quoted market is applied once: its id is remembered. A page that fails
+        leaves `last_trade_poll` where it was, so the next poll reads the same window again and
+        skips what was applied. Fills are written page by page, so memory stays bounded after a
+        long outage. Returns the numbers of taker orders and fills.
+        """
         started = time.time()
-        page_rows = list(self.client.recent_trades(int(self.last_trade_poll) - TRADE_OVERLAP_S))
-        rows, newest = [], 0
-        for t in page_rows:
-            tid = str(t.get("trade_id", ""))
-            if tid in self.seen_set:
-                continue
-            if len(self.seen_ids) == self.seen_ids.maxlen:
-                self.seen_set.discard(self.seen_ids[0])
-            self.seen_ids.append(tid)
-            self.seen_set.add(tid)
-            row = normalize_trade(t)
-            if row is None:
-                continue
-            newest = max(newest, row[5])
-            if row[0] in self.sim.orders:
-                rows.append(row)
+        n_orders = n_fills = newest = 0
+        for page in self.client.recent_trade_pages(int(self.last_trade_poll) - TRADE_OVERLAP_S):
+            rows = []
+            for t in page:
+                row = normalize_trade(t)
+                if row is None:
+                    continue
+                newest = max(newest, row[5])
+                if row[0] in self.sim.orders and row[1] not in self.seen_set:
+                    self._remember(row[1])
+                    rows.append(row)
+            orders = group_taker_orders(rows)
+            fills = [f for o in orders for f in self.sim.on_taker_order(o)]
+            write_fills(self.db, fills, self.known, self.run_id)
+            n_orders, n_fills = n_orders + len(orders), n_fills + len(fills)
         if newest:
             self.trade_lag_s = started - newest / 1e6
         self.last_trade_poll = started
         self.last_tape_ok = time.time()
-        return group_taker_orders(rows)
+        return n_orders, n_fills
+
+    def watchdog(self) -> bool:
+        """Blind for too long: pull every quote. True when quoting must pause."""
+        if time.time() - self.last_tape_ok <= TAPE_WATCHDOG_S:
+            return False
+        cancel_at = int(time.time() * 1e6) + self.delay_us
+        for t in list(self.sim.orders):
+            self.sim.cancel_all(t, cancel_at)
+        return True
 
     def refresh_books(self) -> list[Fill]:
         fills = []
@@ -552,28 +575,21 @@ class PaperMaker:
         t0 = time.time()
         req0 = self.client.requests
         errors: list[str] = []
+        self.watchdog()
         self._stage("listing", errors, self.listing_step)
         self._stage("incremental", errors, self.incremental_step)
         self._stage("scan", errors, self.scan_step)
         self.choose_active(int(time.time() * 1e6))
-        n_fills = 0
-        taker_orders = self._stage("trades", errors, self.poll_trades) or []
-        tape_fills = [f for t in taker_orders for f in self.sim.on_taker_order(t)]
-        write_fills(self.db, tape_fills, self.known, self.run_id)
-        n_fills += len(tape_fills)
-        if time.time() - self.last_tape_ok > TAPE_WATCHDOG_S:
-            # blind for too long: pull every quote and post nothing until the tape is back
-            cancel_at = int(time.time() * 1e6) + self.delay_us
-            for t in list(self.sim.orders):
-                self.sim.cancel_all(t, cancel_at)
-        else:
+        n_orders, n_fills = self._stage("trades", errors, self.poll_trades) or (0, 0)
+        if not self.watchdog():
             book_fills = self._stage("books", errors, self.refresh_books) or []
             write_fills(self.db, book_fills, self.known, self.run_id)
             n_fills += len(book_fills)
-        self.sim.prune(int((time.time() - 3 * max(self.s.cycle_s, TRADE_OVERLAP_S)) * 1e6))
+        # forget canceled quotes only once a complete poll has read the tape past their cancel
+        self.sim.prune(int((self.last_trade_poll - 2 * TRADE_OVERLAP_S) * 1e6))
         if time.time() - self.last_settle > 600:
             self._stage("settlements", errors, self.check_settlements)
-        n_orders = sum(len(self.sim.live_orders(t)) for t in self.sim.orders)
+        n_live = sum(len(self.sim.live_orders(t)) for t in self.sim.orders)
         self.db.execute(
             "INSERT INTO cycles VALUES (?,?,?,?,?,?,?,?,?,?)",
             (
@@ -581,8 +597,8 @@ class PaperMaker:
                 time.time() - t0,
                 len(self.active),
                 len(self.candidates),
+                n_live,
                 n_orders,
-                len(taker_orders),
                 n_fills,
                 self.client.requests - req0,
                 self.trade_lag_s,

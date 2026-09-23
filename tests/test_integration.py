@@ -196,17 +196,17 @@ class FakeLive:
         self.requests += 1
         return [self._market(t) for t in tickers if t == "KXM-E1-A"]
 
-    def recent_trades(self, min_ts):
+    def recent_trade_pages(self, min_ts):
         self.requests += 1
         if self.fail_trades:
 
             def broken():
-                yield from self.tape[:1]
+                yield self.tape[:1]
                 raise RuntimeError("page 2 failed")
 
             return broken()
         out, self.tape = self.tape, []
-        return iter(out)
+        return iter([out])
 
 
 def _trade(tid, price, qty):
@@ -241,11 +241,13 @@ def test_paper_maker_cycles(tmp_path, monkeypatch):
     assert quotes == [("JOIN", 0.20, 30.0), ("PENNY", 0.19, 0.0)]
     time.sleep(1.1)  # let the quotes go live
 
-    # a trade poll that fails on its second page loses nothing: the next poll sees the trade
+    # a poll that fails on its second page keeps what the first page applied, and the retry
+    # reads the same window again without applying the trade twice
     fake.tape = [_trade("x1", 0.20, 40.0)]
     fake.fail_trades = True
+    last_poll = pm.last_trade_poll
     pm.cycle()
-    assert pm.db.execute("SELECT count(*) FROM fills").fetchone()[0] == 0
+    assert pm.last_trade_poll == last_poll  # the window did not move
     assert "trades" in pm.db.execute("SELECT errors FROM cycles ORDER BY ts_us DESC").fetchone()[0]
     fake.fail_trades = False
     pm.cycle()
@@ -280,3 +282,93 @@ def test_tape_watchdog_pulls_quotes(tmp_path, monkeypatch):
     pm.last_tape_ok -= 1000  # blind for longer than the watchdog allows
     pm.cycle()
     assert pm.sim.live_orders("KXM-E1-A") == []
+
+
+def test_a_quote_replaced_during_an_outage_still_fills_from_the_backlog(tmp_path, monkeypatch):
+    gate = {
+        "generated_at": "x",
+        "valid": True,
+        "qualifying": [
+            {"variant": "PENNY", "category": "Mentions", "side": "short_yes", "bucket": 1}
+        ],
+    }
+    monkeypatch.setenv("KM_DATA_DIR", str(tmp_path))
+    fake = FakeLive()
+    pm = PaperMaker(Settings(), fake, gate, {"KXM": ("Mentions", "quadratic", 1.0)})
+    pm.cycle()  # PENNY ask at 0.19
+    time.sleep(1.1)
+    hit = _trade("z1", 0.19, 5.0)  # a taker lifts our ask while the tape cannot be read
+    fake.fail_trades, fake.tape = True, []
+    fake.book = {**fake.book, "yes_ask_dollars": "0.2500"}  # the ask moves: requote at 0.24
+    pm.cycle()
+    (old,) = [o for o in pm.sim.orders["KXM-E1-A"] if o.price == 0.19]
+    assert old.cancel_us != 2**62
+    for _ in range(3):  # a long outage: many cycles, pruning must keep the canceled quote
+        pm.last_tape_ok = time.time()  # keep the watchdog out of this test
+        pm.cycle()
+    assert any(o.price == 0.19 for o in pm.sim.orders["KXM-E1-A"])
+    fake.fail_trades, fake.tape = False, [hit]
+    pm.cycle()
+    got = pm.db.execute("SELECT price, qty FROM fills").fetchall()
+    assert got == [(0.19, 5.0)]
+
+
+def test_failed_checks_are_retried_until_the_markets_are_final(pipeline_env, monkeypatch):
+    api, data_dir, reports_dir = pipeline_env
+    for m in api.markets[True].values():  # every market not yet final at the first download
+        m["status"] = "determined"
+    sleeps = []
+
+    def fake_sleep(seconds):
+        sleeps.append(seconds)
+        for m in api.markets[True].values():
+            m["status"] = "finalized"
+
+    monkeypatch.setattr(cli.time, "sleep", fake_sleep)
+    cli.cmd_pipeline(Settings(), holdout=False, retry_wait_s=86400)
+    gate = json.loads((data_dir / "gate.json").read_text())
+    assert sleeps == [86400] and gate["valid"]
+    assert "Pending" not in (reports_dir / "BACKTEST.md").read_text()
+
+
+def test_an_invalid_gate_is_written_only_after_six_days(pipeline_env, monkeypatch):
+    api, data_dir, reports_dir = pipeline_env
+    for m in api.markets[True].values():
+        m["status"] = "determined"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    (data_dir / "first_decision_attempt.txt").write_text(f"{time.time() - 7 * 86400:.0f}")
+    cli.cmd_pipeline(Settings(), holdout=False)
+    gate = json.loads((data_dir / "gate.json").read_text())
+    assert not gate["valid"] and "non-final" in gate["invalid_reasons"][0]
+    text, digest = report.forward_report(data_dir)
+    assert "validity checks" in digest
+
+
+def test_retry_gives_up_on_client_errors_and_retries_transient_ones():
+    from kmaker.client import KalshiClientError, KalshiError
+
+    calls = []
+
+    def flaky():
+        calls.append(1)
+        if len(calls) < 3:
+            raise KalshiError("HTTP 503")
+        return "ok"
+
+    assert cli._retry(flaky, wait_s=0) == "ok" and len(calls) == 3
+
+    def wrong():
+        raise KalshiClientError("HTTP 400")
+
+    with pytest.raises(KalshiClientError):
+        cli._retry(wrong, wait_s=0)
+
+
+def test_no_data_writes_an_invalid_gate_only_on_the_final_attempt(tmp_path):
+    d, r = tmp_path / "data", tmp_path / "reports"
+    d.mkdir()
+    s = backtest.run(d, r, 0, write_gate=True, final_attempt=False)
+    assert not s["validity"]["valid"] and not (d / "gate.json").exists()
+    s = backtest.run(d, r, 0, write_gate=True, final_attempt=True)
+    gate = json.loads((d / "gate.json").read_text())
+    assert not gate["valid"] and gate["invalid_reasons"] == ["no market record was downloaded"]

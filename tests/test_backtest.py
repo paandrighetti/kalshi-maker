@@ -187,17 +187,45 @@ def test_tapered_grid_ticks_and_float_buckets(tmp_path):
     assert got == [(LONG, 1, -0.1), (SHORT, 0, 0.099), (SHORT, 3, 0.89)]
 
 
-def test_periods_follow_settlement_date(tmp_path):
+def test_periods_follow_latest_expiration_not_settlement(tmp_path):
+    """An early YES settles before 1 May but belongs to the period of its latest expiration."""
     trades = [
         ("KXM-E1-A", "t1", 1.0, 0.30, True, us("2026-04-20T00:00:00"), False),
-        ("KXM-E1-A", "t2", 1.0, 0.30, True, us("2026-05-03T00:00:00"), False),
+        ("KXM-E2-A", "t2", 1.0, 0.30, True, us("2026-04-20T00:00:00"), False),
     ]
-    markets = [market("KXM-E1-A", "KXM-E1", "KXM", "no", settled="2026-05-04T00:00:00")]
+    markets = [
+        market(
+            "KXM-E1-A",
+            "KXM-E1",
+            "KXM",
+            "yes",
+            settled="2026-04-25T00:00:00",
+            latest_expiration_us=us("2026-05-20T00:00:00"),
+        ),
+        market("KXM-E2-A", "KXM-E2", "KXM", "no", settled="2026-04-28T00:00:00"),
+    ]
     d = write_dir(tmp_path, markets, trades)
     con = backtest.connect(d / "work.duckdb")
     backtest.build_tables(con, d, 0)
     backtest.create_src(con)
-    assert con.execute("SELECT DISTINCT period FROM src").fetchall() == [(1,)]
+    got = con.execute(
+        "SELECT a.ticker, s.period FROM (SELECT DISTINCT eid, period FROM src) s "
+        "JOIN mka a USING (eid) ORDER BY 1"
+    ).fetchall()
+    assert got == [("KXM-E1-A", 1), ("KXM-E2-A", 0)]
+
+
+def test_markets_without_settlement_time_cluster_on_trade_date(tmp_path):
+    t = us("2026-01-05T12:00:00")
+    trades = [("KXM-E1-A", "t1", 1.0, 0.30, True, t, False)]
+    markets = [market("KXM-E1-A", "KXM-E1", "KXM", "no", settlement_us=None)]
+    d = write_dir(tmp_path, markets, trades)
+    con = backtest.connect(d / "work.duckdb")
+    counts = backtest.build_tables(con, d, 0)
+    assert counts["trades_ok"] == 1 and counts["markets_without_settlement_time"] == 1
+    backtest.create_src(con)
+    cl = con.execute("SELECT DISTINCT cl % 100000 FROM src").fetchall()
+    assert cl == [(t // 86_400_000_000,)]
 
 
 def test_events_are_distinct_in_rollups(tmp_path):

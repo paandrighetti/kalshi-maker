@@ -1,9 +1,9 @@
 """Statistics A, B and C of PREREGISTRATION.md on the downloaded sample, and the gate.
 
 Every decision uses only what was known when a trade printed: its market, category, price,
-size and the direction of the taker. Markets are selected on `latest_expiration_time`, fixed at
-listing. The outcome enters only as the settlement value of the maker's position; the settlement
-date only as a cluster label and to assign a market to a period.
+size and the direction of the taker. Markets are selected, and assigned to a period, on
+`latest_expiration_time`, fixed at listing. The outcome enters only as the settlement value of
+the maker's position, and the settlement date only as a cluster label.
 
 All per-print work happens in a DuckDB file on disk with a memory cap. Strings are replaced by
 integer codes before any large aggregation, and taker orders are built with aggregations and
@@ -57,7 +57,7 @@ def horizon_label(i: int) -> str:
     return f"{e[i]:g}-{e[i + 1]:g}h" if i + 1 < len(e) else f"{e[-1]:g}h+"
 
 
-def connect(path: Path, memory_limit: str = "400MB") -> duckdb.DuckDBPyConnection:
+def connect(path: Path, memory_limit: str = "500MB") -> duckdb.DuckDBPyConnection:
     path.parent.mkdir(parents=True, exist_ok=True)
     for p in (path, path.with_suffix(path.suffix + ".wal")):
         p.unlink(missing_ok=True)
@@ -85,7 +85,8 @@ def build_tables(con: duckdb.DuckDBPyConnection, data_dir: Path, residue: int) -
     con.execute(
         f"""
         CREATE OR REPLACE TABLE mk0 AS
-        SELECT * EXCLUDE (filename), regexp_extract(filename, 'part-[0-9]+') AS part
+        SELECT * EXCLUDE (filename),
+               regexp_extract(filename, '(part-[0-9]+)[.]parquet$', 1) AS part
         FROM read_parquet('{data_dir}/markets/*.parquet', filename = true)
         QUALIFY row_number() OVER (PARTITION BY ticker ORDER BY filename DESC) = 1
         """
@@ -101,7 +102,9 @@ def build_tables(con: duckdb.DuckDBPyConnection, data_dir: Path, residue: int) -
                CASE WHEN s.fee_type = 'quadratic_with_maker_fees'
                     THEN {coef} * coalesce(s.fee_multiplier, 1.0) ELSE 0.0 END AS fee_rate,
                CAST(floor(m.settlement_us / 86400e6) AS BIGINT) AS sday,
-               CASE WHEN m.settlement_us < {_us(PREREG.split)} THEN 0 ELSE 1 END AS period,
+               CASE WHEN m.latest_expiration_us < {_us(PREREG.split)} THEN 0 ELSE 1 END
+                   AS period,
+               m.settlement_us > m.latest_expiration_us + 86400e6 AS settled_late,
                CASE
                    WHEN s.series IS NULL THEN 'unknown_series'
                    WHEN s.category IN ({excluded}) THEN 'excluded_category'
@@ -111,7 +114,6 @@ def build_tables(con: duckdb.DuckDBPyConnection, data_dir: Path, residue: int) -
                         THEN 'late_expiration'
                    WHEN m.status NOT IN ({finals}) THEN 'not_final'
                    WHEN m.result NOT IN ('yes', 'no') THEN 'not_binary'
-                   WHEN m.settlement_us IS NULL THEN 'no_settlement_time'
                    ELSE 'ok'
                END AS reason
         FROM mk0 m LEFT JOIN sr s ON s.series = m.series
@@ -123,7 +125,7 @@ def build_tables(con: duckdb.DuckDBPyConnection, data_dir: Path, residue: int) -
         SELECT a.mid, r.lo, r.hi, r.step
         FROM read_parquet('{data_dir}/ranges/*.parquet', filename = true) r
         JOIN mka a ON a.ticker = r.ticker
-                  AND a.part = regexp_extract(r.filename, 'part-[0-9]+')
+                  AND a.part = regexp_extract(r.filename, '(part-[0-9]+)[.]parquet$', 1)
         """
     )
     trades = f"{data_dir}/trades_r{residue}/*.parquet"
@@ -169,6 +171,12 @@ def build_tables(con: duckdb.DuckDBPyConnection, data_dir: Path, residue: int) -
     counts["orders"] = one("SELECT count(*) FROM ord")
     counts["events"] = one("SELECT count(DISTINCT eid) FROM mka WHERE mid IN (SELECT mid FROM lv)")
     counts["markets"] = one("SELECT count(DISTINCT mid) FROM lv")
+    counts["markets_without_settlement_time"] = one(
+        "SELECT count(*) FROM mka WHERE settlement_us IS NULL AND mid IN (SELECT mid FROM lv)"
+    )
+    counts["markets_settled_after_latest_expiration"] = one(
+        "SELECT count(*) FROM mka WHERE settled_late AND mid IN (SELECT mid FROM lv)"
+    )
     return counts
 
 
@@ -177,7 +185,11 @@ def create_src(con: duckdb.DuckDBPyConnection) -> None:
     cap = PREREG.penny_fill_cap
     side = "CASE WHEN taker_yes THEN 0 ELSE 1 END"
     d = "CASE WHEN taker_yes THEN -1.0 ELSE 1.0 END"
-    cl = f"a.cid * {CLUSTER_DAYS} + a.sday"
+
+    def cl(t: str) -> str:
+        day = f"coalesce(a.sday, CAST(floor({t}.created_us / 86400e6) AS BIGINT))"
+        return f"a.cid * {CLUSTER_DAYS} + {day}"
+
     con.execute(
         f"""
         CREATE OR REPLACE VIEW src AS
@@ -194,11 +206,11 @@ def create_src(con: duckdb.DuckDBPyConnection) -> None:
             FROM b1
         )
         SELECT 0 AS stat, a.period, a.cid, {side} AS side, {_bucket_sql("l.p")} AS bucket,
-               a.eid, {cl} AS cl, l.qty AS w,
+               a.eid, {cl("l")} AS cl, l.qty AS w,
                {d} * (a.o - l.p) - a.fee_rate * l.p * (1 - l.p) AS v
         FROM lv l JOIN mka a USING (mid)
         UNION ALL
-        SELECT 2, a.period, a.cid, {side}, {_bucket_sql("l.p")}, a.eid, {cl}, l.qty,
+        SELECT 2, a.period, a.cid, {side}, {_bucket_sql("l.p")}, a.eid, {cl("l")}, l.qty,
                {d} * (a.o - l.p) - a.fee_rate * l.p * (1 - l.p)
         FROM lv l
         JOIN (SELECT mid, created_us, taker_yes, last_p FROM ord WHERE nlv > 1) o
@@ -206,7 +218,7 @@ def create_src(con: duckdb.DuckDBPyConnection) -> None:
         JOIN mka a USING (mid)
         WHERE l.p <> o.last_p
         UNION ALL
-        SELECT 1, a.period, a.cid, {side}, {_bucket_sql("b.a_price")}, a.eid, {cl}, b.q,
+        SELECT 1, a.period, a.cid, {side}, {_bucket_sql("b.a_price")}, a.eid, {cl("b")}, b.q,
                {d} * (a.o - b.a_price)
                - ceil(round(a.fee_rate * b.q * b.a_price * (1 - b.a_price) * 100, 9)) / 100 / b.q
         FROM b2 b JOIN mka a USING (mid)
@@ -232,16 +244,17 @@ def cell_stats(
         )
         """
     )
-    con.execute(
-        f"""
-        CREATE OR REPLACE TABLE ev AS
-        SELECT {sel}, events FROM (
-            SELECT {raw}, count(DISTINCT eid) AS events
-            FROM (SELECT DISTINCT {raw}, eid FROM {src})
-            GROUP BY {", ".join(fixed)}{cube_sql}
+    # distinct events per cell, one roll-up at a time: two plain aggregations, which DuckDB
+    # spills to disk, where count(DISTINCT) under CUBE ran out of memory on large samples
+    con.execute(f"CREATE OR REPLACE TABLE evd AS SELECT DISTINCT {raw}, eid FROM {src}")
+    parts = []
+    for mask in range(2 ** len(cube)):
+        cols = fixed + [c if mask >> i & 1 == 0 else f"-1 AS {c}" for i, c in enumerate(cube)]
+        parts.append(
+            f"SELECT {raw}, count(*) AS events FROM "
+            f"(SELECT DISTINCT {', '.join(cols)}, eid FROM evd) GROUP BY {raw}"
         )
-        """
-    )
+    con.execute(f"CREATE OR REPLACE TABLE ev AS {' UNION ALL '.join(parts)}")
     tk = ", ".join("t." + c for c in keys)
     on = " AND ".join(f"g.{c} = t.{c}" for c in keys)
     df = con.execute(
@@ -299,10 +312,12 @@ def diagnostics(con: duckdb.DuckDBPyConnection) -> dict[str, pd.DataFrame]:
         f"""
         CREATE OR REPLACE VIEW src_h AS
         SELECT {_horizon_sql(hours)} AS horizon, CASE WHEN l.taker_yes THEN 0 ELSE 1 END AS side,
-               a.eid, a.cid * {CLUSTER_DAYS} + a.sday AS cl, l.qty AS w,
+               a.eid, a.cid * {CLUSTER_DAYS}
+                   + coalesce(a.sday, CAST(floor(l.created_us / 86400e6) AS BIGINT)) AS cl,
+               l.qty AS w,
                CASE WHEN l.taker_yes THEN -1.0 ELSE 1.0 END * (a.o - l.p)
                - a.fee_rate * l.p * (1 - l.p) AS v
-        FROM lv l JOIN mka a USING (mid)
+        FROM lv l JOIN mka a USING (mid) WHERE a.settlement_us IS NOT NULL
         """
     )
     h = cell_stats(con, "src_h", ["horizon", "side"], [])
@@ -320,10 +335,7 @@ def validity(data_dir: Path, residue: int, counts: dict, cells: pd.DataFrame) ->
     in_window = (
         counts["trades"] - counts.get("trades_block", 0) - counts.get("trades_outside_window", 0)
     )
-    eligible = sum(
-        counts.get(f"trades_{k}", 0)
-        for k in ("ok", "not_final", "not_binary", "no_settlement_time")
-    )
+    eligible = sum(counts.get(f"trades_{k}", 0) for k in ("ok", "not_final", "not_binary"))
     a = cells[(cells["stat"] == "A") & (cells["category"] == "ALL")]
     periods = sorted(set(a.loc[a["contracts"] > 0, "sample"]) & set(SAMPLES))
     v = {
@@ -347,16 +359,66 @@ def validity(data_dir: Path, residue: int, counts: dict, cells: pd.DataFrame) ->
     return v
 
 
+def needed_gb(data_dir: Path, residue: int) -> float:
+    """Scratch disk for DuckDB with a 500 MB memory cap: 3.7 GB measured at 36M trades, so
+    about 100 bytes per trade; the estimate takes 130 plus a fixed gigabyte."""
+    n = sum(hour_counts(data_dir, residue).values())
+    return 1.0 + 1.3e-7 * n
+
+
+def _no_data(data_dir: Path, residue: int) -> str | None:
+    if not list((data_dir / "markets").glob("part-*.parquet")):
+        return "no market record was downloaded"
+    if not list((data_dir / f"trades_r{residue}").glob("*.parquet")):
+        return "no trade file was downloaded"
+    return None
+
+
+def _write_gate(path: Path, gate: dict) -> None:
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(gate, indent=2))
+    tmp.replace(path)
+
+
 def run(
-    data_dir: Path, reports_dir: Path, residue: int, write_gate: bool, min_free_gb: float = 4.0
+    data_dir: Path,
+    reports_dir: Path,
+    residue: int,
+    write_gate: bool,
+    final_attempt: bool = True,
 ) -> dict:
+    """Statistics, checks and, for the primary sample, the gate.
+
+    With failed checks, the gate is written (as invalid) only on the final attempt; before
+    that the caller downloads again and retries (Amendment 3).
+    """
     label = "primary" if residue == PREREG.primary_residue else f"r{residue}"
     out_dir = reports_dir / "backtest" / label
     out_dir.mkdir(parents=True, exist_ok=True)
-    # DuckDB's work file and spill directory need about 125 bytes per trade (2.5 GB at 20M)
-    free = shutil.disk_usage(data_dir).free / 1e9
-    if free < min_free_gb:
-        raise RuntimeError(f"{free:.1f} GB free on {data_dir}, the backtest needs {min_free_gb}")
+    gate_path = data_dir / "gate.json"
+    missing = _no_data(data_dir, residue)
+    if missing:
+        checks = {"valid": False, "reasons": [missing]}
+        summary = {"label": label, "residue": residue, "validity": checks, "gate_written": False}
+        if write_gate and final_attempt and not gate_path.exists():
+            _write_gate(
+                gate_path,
+                {
+                    "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "prereg_sha256": prereg_sha256(),
+                    "valid": False,
+                    "invalid_reasons": [missing],
+                    "replication_fails": False,
+                    "pairs_tested": 0,
+                    "qualifying": [],
+                },
+            )
+            summary["gate_written"] = True
+        (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
+        return summary
+    free, need = shutil.disk_usage(data_dir).free / 1e9, needed_gb(data_dir, residue)
+    if free < need:
+        raise RuntimeError(f"{free:.1f} GB free on {data_dir}, the backtest needs {need:.1f}")
     db_path = data_dir / f"work_r{residue}.duckdb"
     con = connect(db_path)
     try:
@@ -405,9 +467,11 @@ def run(
             checks["valid"] and all(replication[s]["mean_c"] < 0 for s in SAMPLES)
         ),
     }
-    gate_path = data_dir / "gate.json"
+    summary["gate_written"] = False
     if write_gate and gate_path.exists():
         log.warning("gate.json exists and is never overwritten; primary statistics only reported")
+    elif write_gate and not checks["valid"] and not final_attempt:
+        log.warning("validity checks failed, gate deferred: %s", checks["reasons"])
     elif write_gate:
         qualifying, tested = decide(cells) if checks["valid"] else ([], 0)
         summary["pairs_tested"] = tested
@@ -421,9 +485,8 @@ def run(
             "pairs_tested": tested,
             "qualifying": qualifying,
         }
-        tmp = gate_path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(gate, indent=2))
-        tmp.replace(gate_path)
+        _write_gate(gate_path, gate)
+        summary["gate_written"] = True
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
     return summary
 

@@ -51,29 +51,34 @@ def md_table(df: pd.DataFrame, floats: dict[str, int] | None = None) -> str:
 def backtest_report(reports_dir: Path, data_dir: Path) -> str:
     base = reports_dir / "backtest" / "primary"
     summary = json.loads((base / "summary.json").read_text())
-    cells = pd.read_csv(base / "cells.csv")
-    overall = pd.read_csv(base / "overall.csv")
-    volume = pd.read_csv(base / "volume.csv")
-    gate = json.loads((data_dir / "gate.json").read_text())
+    gate_path = data_dir / "gate.json"
+    gate = json.loads(gate_path.read_text()) if gate_path.exists() else None
+    checks = summary.get("validity", {})
     edges = PREREG.buckets
     out = [
         "# Backtest: the retail-flow premium for a small Kalshi maker",
         "",
-        f"Generated {summary['generated_at']} from `reports/backtest/primary/`. "
-        f"Pre-registration SHA-256 `{summary['prereg_sha256']}`.",
+        f"Generated {summary.get('generated_at', 'n/a')} from `reports/backtest/primary/`. "
+        f"Pre-registration SHA-256 `{summary.get('prereg_sha256', prereg_sha256())}`.",
         "",
         "## Verdict",
         "",
     ]
-    q = gate["qualifying"]
-    checks = summary.get("validity", {})
-    if not gate.get("valid", True):
+    if gate is None:
+        out.append(
+            "Pending: the data failed the pre-registered checks ("
+            + "; ".join(checks.get("reasons", []))
+            + "). The empty hours and the non-final markets are downloaded again every day, "
+            "and the gate is written after at most 7 days (Amendment 3)."
+        )
+    elif not gate.get("valid", True):
         out.append(
             "No conclusion: the data failed the pre-registered validity checks ("
             + "; ".join(gate.get("invalid_reasons", []))
             + "). No pair was tested and the paper maker does not quote."
         )
-    elif q:
+    elif gate["qualifying"]:
+        q = gate["qualifying"]
         out.append(
             f"{len(q)} of {gate['pairs_tested']} pre-registered (variant, cell) pairs qualify: "
             "positive with t >= 2 in both the exploration and the confirmation samples."
@@ -87,6 +92,11 @@ def backtest_report(reports_dir: Path, data_dir: Path) -> str:
             "A small maker has no demonstrated edge on Kalshi's non-sports markets in this sample, "
             "and the paper maker does not quote."
         )
+    if "counts" not in summary:  # nothing was computed: no data yet
+        return "\n".join(out) + "\n"
+    cells = pd.read_csv(base / "cells.csv")
+    overall = pd.read_csv(base / "overall.csv")
+    volume = pd.read_csv(base / "volume.csv")
     rep = summary["replication_A_pooled"]
     out += [
         "",
@@ -119,7 +129,9 @@ def backtest_report(reports_dir: Path, data_dir: Path) -> str:
         f"{checks.get('unmatched_share', float('nan')):.2%} (limit "
         f"{PREREG.max_unmatched_share:.0%}); eligible trades in non-final markets "
         f"{checks.get('unsettled_share', float('nan')):.2%} (limit "
-        f"{PREREG.max_unsettled_share:.0%}).",
+        f"{PREREG.max_unsettled_share:.0%}). Markets settled more than a day after their latest "
+        f"expiration, which would reveal a moved field: "
+        f"{summary['counts'].get('markets_settled_after_latest_expiration', 0)}.",
         "",
         md_table(pd.DataFrame(sorted(summary["counts"].items()), columns=["count", "value"])),
         "",
@@ -134,12 +146,18 @@ def backtest_report(reports_dir: Path, data_dir: Path) -> str:
     )
     ov.columns = [f"{a}_{b}" for a, b in ov.columns]
     out += [md_table(ov.reset_index(), {c: 2 for c in ov.columns if not c.startswith("events")})]
-    out += ["", "## Every cell (statistics B and C decide PENNY and JOIN)", ""]
+    out += [
+        "",
+        "## Every cell (statistics B and C decide PENNY and JOIN)",
+        "",
+        "`rows` counts price levels of taker orders for A and C, and taker orders for B.",
+        "",
+    ]
     c = cells[cells["sample"].isin(["exploration", "confirmation"])].copy()
     c["bucket"] = c["bucket"].map(lambda b: bucket_label(int(b), edges))
     out += [md_table(c, {"mean_c": 3, "se_c": 3, "t": 2, "contracts": 0, "rows": 0})]
     hold = reports_dir / "backtest" / f"r{PREREG.holdout_residue}" / "cells.csv"
-    if hold.exists() and q:
+    if hold.exists() and gate and gate["qualifying"]:
         from .backtest import holdout_check
 
         hc = holdout_check(reports_dir, gate, f"r{PREREG.holdout_residue}")

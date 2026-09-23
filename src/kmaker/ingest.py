@@ -109,6 +109,18 @@ def write_rows(rows: list, schema: pa.Schema, path: Path) -> None:
     _write_table(pa.table(cols, schema=schema), path)
 
 
+def _write_text_atomic(path: Path, text: str) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
+def _write_df_atomic(df: pd.DataFrame, path: Path) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    df.to_parquet(tmp, index=False)
+    os.replace(tmp, path)
+
+
 def free_gb(path: Path) -> float:
     path.mkdir(parents=True, exist_ok=True)
     return shutil.disk_usage(path).free / 1e9
@@ -132,7 +144,7 @@ def ingest_series(client: Kalshi, data_dir: Path) -> pd.DataFrame:
     rows = [_series_row(s) for s in client.series() if s.get("ticker")]
     df = pd.DataFrame(rows).drop_duplicates("series")
     data_dir.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(data_dir / "series.parquet", index=False)
+    _write_df_atomic(df, data_dir / "series.parquet")
     log.info("series: %d, categories: %s", len(df), sorted(df["category"].unique()))
     return df
 
@@ -156,7 +168,7 @@ def ingest_missing_series(client: Kalshi, data_dir: Path) -> int:
     rows = [_series_row(s) for s in map(client.series_one, missing) if s and s.get("ticker")]
     if rows:
         df = pd.concat([series, pd.DataFrame(rows)], ignore_index=True).drop_duplicates("series")
-        df.to_parquet(data_dir / "series.parquet", index=False)
+        _write_df_atomic(df, data_dir / "series.parquet")
     log.info("series missing from the listing: %d, fetched: %d", len(missing), len(rows))
     return len(rows)
 
@@ -210,7 +222,7 @@ def ingest_trades(
         rows = trades_for_hour(client, h, drop)
         write_rows(rows, TRADE_SCHEMA, out_dir / f"{hour_key(h)}.parquet")
         counts[hour_key(h)] = len(rows)
-        manifest.write_text(json.dumps(counts, sort_keys=True))
+        _write_text_atomic(manifest, json.dumps(counts, sort_keys=True))
 
     for i, h in enumerate(hours):
         if hour_key(h) in counts and (out_dir / f"{hour_key(h)}.parquet").exists():
@@ -275,16 +287,17 @@ def ingest_markets(client: Kalshi, data_dir: Path, trade_paths: Iterable[Path]) 
     not_found = 0
 
     def flush() -> None:
+        # the ranges part first: a market part on disk means its price grids are there too
         nonlocal rows, part
         if not rows:
             return
-        write_rows(rows, MARKET_SCHEMA, out_dir / f"part-{part:05d}.parquet")
         ranges = []
         for r in rows:
             parsed = parse_ranges(r["price_ranges"])
             if parsed != DEFAULT_RANGES:
                 ranges += [(r["ticker"], lo, hi, step) for lo, hi, step in parsed]
         write_rows(ranges, RANGE_SCHEMA, data_dir / "ranges" / f"part-{part:05d}.parquet")
+        write_rows(rows, MARKET_SCHEMA, out_dir / f"part-{part:05d}.parquet")
         rows, part = [], part + 1
 
     for i in range(0, len(todo), MARKET_BATCH):
@@ -309,9 +322,9 @@ def ingest_markets(client: Kalshi, data_dir: Path, trade_paths: Iterable[Path]) 
 
 
 def write_manifest(data_dir: Path, residue: int, extra: dict) -> None:
-    path = data_dir / f"manifest_r{residue}.json"
     stamp = datetime.now(timezone.utc).isoformat()
-    path.write_text(json.dumps({"residue": residue, "written_at": stamp, **extra}, indent=2))
+    body = json.dumps({"residue": residue, "written_at": stamp, **extra}, indent=2)
+    _write_text_atomic(data_dir / f"manifest_r{residue}.json", body)
 
 
 def load_markets(data_dir: Path) -> pd.DataFrame:

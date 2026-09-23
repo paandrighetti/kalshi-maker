@@ -14,15 +14,19 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import httpx
+
 from . import backtest, ingest, report, telegram
-from .client import Kalshi
+from .client import Kalshi, KalshiClientError, KalshiError
 from .config import PREREG, Settings
 from .paper import PaperMaker
 
 log = logging.getLogger("kmaker")
 
 
-def _client(s: Settings, rate: float | None = None) -> Kalshi:
+def _client(s: Settings, rate: float | None = None, paper: bool = False) -> Kalshi:
+    if paper:  # fail fast, so that the tape watchdog can act within its two minutes
+        return Kalshi(s.api_bases, rate=s.rate_paper, timeout=10.0, max_tries=2)
     return Kalshi(s.api_bases, rate=s.rate if rate is None else rate)
 
 
@@ -53,37 +57,78 @@ def _gate_digest(gate: dict, summary: dict) -> str:
     return "\n".join(lines)
 
 
-def cmd_pipeline(s: Settings, holdout: bool) -> None:
-    """Download, decide once, report; then the holdout. A restart resumes and never re-decides."""
+def _retry(fn, *args, tries: int = 12, wait_s: float = 300.0):
+    """Retry transient failures (API unreachable, 429 or 5xx after the client's own retries,
+    file system errors) for about an hour, so that a long download does not burn the
+    container's few restarts on network hiccups."""
+    for i in range(tries):
+        try:
+            return fn(*args)
+        except KalshiClientError:
+            raise
+        except (KalshiError, httpx.HTTPError, OSError) as exc:
+            if i == tries - 1:
+                raise
+            log.warning(
+                "transient failure: %s; retry %d of %d in %.0f s", exc, i + 1, tries, wait_s
+            )
+            time.sleep(wait_s)
+    return None
+
+
+def _download(s: Settings, c: Kalshi, residue: int) -> None:
+    paths = _retry(ingest.ingest_trades, c, s.data_dir, residue, s.min_free_gb)
+    info = _retry(ingest.ingest_markets, c, s.data_dir, paths)
+    _retry(ingest.ingest_missing_series, c, s.data_dir)
+    ingest.write_manifest(s.data_dir, residue, {**info, "requests": c.requests})
+
+
+def _first_attempt(data_dir: Path) -> float:
+    path = data_dir / "first_decision_attempt.txt"
+    if not path.exists():
+        path.write_text(f"{time.time():.0f}")
+    return float(path.read_text())
+
+
+def cmd_pipeline(s: Settings, holdout: bool, retry_wait_s: float = 86400.0) -> None:
+    """Download, decide once, report; then the holdout. A restart resumes and never re-decides.
+
+    If the data checks fail, the download of empty hours and non-final markets is repeated
+    every day, and the gate is written as invalid only after 6 days (Amendment 3).
+    """
     gate_path = s.data_dir / "gate.json"
     with _client(s) as c:
         if not (s.data_dir / "series.parquet").exists():
-            ingest.ingest_series(c, s.data_dir)
-        residues = [PREREG.primary_residue] + ([PREREG.holdout_residue] if holdout else [])
-        for residue in residues:
-            primary = residue == PREREG.primary_residue
-            label = "primary" if primary else f"r{residue}"
-            if primary and gate_path.exists():
-                log.info("gate.json exists: the primary sample was decided, skipping it")
-                continue
-            if not primary and (s.reports_dir / "backtest" / label / "summary.json").exists():
-                log.info("holdout already computed, skipping it")
-                continue
-            paths = ingest.ingest_trades(c, s.data_dir, residue, s.min_free_gb)
-            info = ingest.ingest_markets(c, s.data_dir, paths)
-            ingest.ingest_missing_series(c, s.data_dir)
-            ingest.write_manifest(s.data_dir, residue, {**info, "requests": c.requests})
-            summary = backtest.run(s.data_dir, s.reports_dir, residue, write_gate=primary)
+            _retry(ingest.ingest_series, c, s.data_dir)
+        primary = PREREG.primary_residue
+        first = None
+        while not gate_path.exists():
+            _download(s, c, primary)
+            first = first or _first_attempt(s.data_dir)
+            final = time.time() - first >= 6 * 86400
+            summary = backtest.run(s.data_dir, s.reports_dir, primary, True, final_attempt=final)
             _write(s.reports_dir / "BACKTEST.md", report.backtest_report(s.reports_dir, s.data_dir))
-            if primary:
+            if summary["gate_written"]:
                 gate = json.loads(gate_path.read_text())
                 telegram.send(s.telegram_token, s.telegram_chat, _gate_digest(gate, summary))
-            else:
-                telegram.send(
-                    s.telegram_token,
-                    s.telegram_chat,
-                    "kalshi-maker: holdout hours added to BACKTEST.md",
-                )
+                break
+            reasons = "; ".join(summary["validity"]["reasons"])
+            telegram.send(
+                s.telegram_token,
+                s.telegram_chat,
+                f"kalshi-maker: data checks failed ({reasons}); new download in 24 h",
+            )
+            time.sleep(retry_wait_s)
+        label = f"r{PREREG.holdout_residue}"
+        if holdout and not (s.reports_dir / "backtest" / label / "summary.json").exists():
+            _download(s, c, PREREG.holdout_residue)
+            backtest.run(s.data_dir, s.reports_dir, PREREG.holdout_residue, False)
+            _write(s.reports_dir / "BACKTEST.md", report.backtest_report(s.reports_dir, s.data_dir))
+            telegram.send(
+                s.telegram_token,
+                s.telegram_chat,
+                "kalshi-maker: holdout hours added to BACKTEST.md",
+            )
 
 
 def _series_map(s: Settings, c: Kalshi) -> dict:
@@ -104,7 +149,7 @@ def cmd_paper(s: Settings) -> None:
         log.info("the gate allows no quoting (invalid data, no pair, or failed replication): idle")
         while True:
             time.sleep(3600)
-    with _client(s, rate=s.rate_paper) as c:
+    with _client(s, paper=True) as c:
         maker = PaperMaker(s, c, gate, _series_map(s, c))
         maker.run_forever()
 

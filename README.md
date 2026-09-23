@@ -73,9 +73,13 @@ docker compose logs -f backtest   # progress of the download, then the verdict
 ```
 
 `KM_RATE` (download, 6 requests per second) and `KM_RATE_PAPER` (paper maker, 4) keep the two
-well under Kalshi's basic limit of about 20 per second together. The backtest needs 4 GB of free
-disk for its DuckDB work file; the download stops below 3 GB. A failed pipeline sends a Telegram
-message and is restarted at most three times; every step resumes where it stopped.
+well under Kalshi's basic limit of about 20 per second together. The backtest's DuckDB work
+file needs about 1 GB plus 130 bytes per downloaded trade of free disk (measured: 36 million
+synthetic trades in 137 s, 943 MB of memory, 3.7 GB of disk); the download stops below 3 GB.
+Transient API failures are retried for about an hour inside the pipeline; if the data checks
+fail, the missing parts are downloaded again every day for up to 6 days before the gate is
+written as invalid. A failed pipeline sends a Telegram message and is restarted at most three
+times; every step resumes where it stopped.
 
 Without Docker: `pip install -e .[dev]`, then `kmaker pipeline`, `kmaker paper`,
 `kmaker report`, and `pytest -q`. `KM_DATA_DIR` and `KM_REPORTS_DIR` default to `data/` and
