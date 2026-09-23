@@ -37,10 +37,12 @@ published studies used?
   holdout sample, used only after the decision, as described below.
 - Exclusions: series whose `category` is `Sports` (institutional market makers, maker fees on
   the main series, most of the volume); multivariate markets (`mve_collection_ticker` set, or a
-  series starting with `KXMVE`); block trades; markets whose `result` is not `yes` or `no` when
-  downloaded.
-- Split: exploration = trades created before 2026-05-01 00:00 UTC; confirmation = trades created
-  on or after that time.
+  series starting with `KXMVE`); block trades; markets whose `latest_expiration_time` is missing
+  or after 2026-09-15 00:00 UTC (Amendment 2); markets whose status is not `finalized` or
+  `settled`, or whose `result` is not `yes` or `no`, when downloaded.
+- Split (Amendment 2): exploration = markets settled before 2026-05-01 00:00 UTC; confirmation =
+  markets settled on or after that time. Every market, and so every outcome, belongs to one
+  period.
 
 ## Definitions
 
@@ -52,11 +54,12 @@ published studies used?
 - Maker direction: d = -1 when `taker_outcome_side` is `yes` (the maker sold YES exposure),
   d = +1 otherwise. With p the YES price in dollars and o = 1 if the market resolved YES, 0
   otherwise, the maker's settlement profit per contract is d(o - p), minus the maker fee.
-- Maker fee per contract: 0.0175 x `fee_multiplier` x p(1 - p) for series whose `fee_type`
-  starts with `quadratic_with`, zero otherwise. Rounded up to the cent per fill where a fill
-  size is defined (statistic B), unrounded otherwise.
+- Maker fee per contract: 0.0175 x `fee_multiplier` x p(1 - p) for series whose `fee_type` is
+  `quadratic_with_maker_fees` (Amendment 2), zero otherwise. Rounded up to the cent per fill
+  where a fill size is defined (statistic B), unrounded otherwise. The fee type is today's; the
+  series history is not published.
 - Tick at price p: the `step` of the market's `price_ranges` interval containing p, 0.01 by
-  default.
+  default. A price moved down by one tick uses the interval just below p (Amendment 2).
 - Side: `short_yes` (d = -1) or `long_yes` (d = +1). Price bucket of the maker's fill price:
   [0, 0.10), [0.10, 0.30), [0.30, 0.70), [0.70, 0.90), [0.90, 1].
 
@@ -96,7 +99,16 @@ tested is printed with the result.
 
 Holdout: once the gate is written, the same statistics are computed on the holdout hours. A
 qualifying pair whose holdout mean is negative is reported as contradicted. The holdout neither
-adds nor removes pairs.
+adds nor removes pairs. It draws other trades on the same markets, so it tests the robustness
+of the estimate to the sampling of trades, not to new outcomes.
+
+Data validity (Amendment 2): no gate is written, and no conclusion is drawn, if more than 2 % of
+the sampled hours returned no trade, if more than 5 % of the downloaded trades have no market
+record, if more than 1 % of the trades of eligible markets belong to markets not final at
+download, or if either period has no data. The gate then says why, and the paper maker does not
+quote.
+
+The gate is written once. A later run never overwrites it.
 
 Replication check: if statistic A pooled over all categories is negative in both samples, the
 literature does not replicate on this data, and the data handling is audited before any result
@@ -104,8 +116,9 @@ is used.
 
 ## Forward test (paper)
 
-- Universe: open, non-multivariate markets in the categories of qualifying pairs, expected
-  expiration within 7 days, with both a bid and an ask.
+- Universe: open, non-multivariate markets in the categories of qualifying pairs, closing
+  within 7 days (the earlier of `close_time` and `expected_expiration_time`; Amendment 2), with
+  both a bid and an ask.
 - Every cycle (target 20 s), for each qualifying (variant, side): PENNY quotes one tick inside
   the best price when the spread is at least two ticks and joins the best price otherwise; JOIN
   always joins the best price. Size 10 contracts. A quote goes live one second after the book it
@@ -115,7 +128,9 @@ is used.
   the quote price when the quote joined it (zero when it improved the price), reduced only by
   traded volume, never by cancellations. A quote crossed by the opposite best price at the next
   book is filled against that best size, less the queue ahead. A quote whose price is no longer
-  the target is canceled and replaced with a new queue position.
+  the target is canceled and replaced with a new queue position; the cancel takes effect after
+  the same one-second delay as a new quote (Amendment 2).
+- Settlement is recorded only once the market is `finalized` or `settled`.
 - Positions are held to settlement. Strategy view: fills in qualifying pairs, at most 100
   contracts per market and variant, 500 USD at risk per event, 5,000 USD in total.
 - Success: pooled strategy-view profit per contract > 0 with t >= 2 (clusters as in the
@@ -136,6 +151,31 @@ only:
   clusters has a variance estimate that has not yet seen the tail, and its t is not credible.
   The usual condition for a normal approximation to a binomial is about ten occurrences of each
   outcome, hence the floor of 10 negative clusters, together with 100 distinct events.
+
+Amendment 2, 23 September 2026, before any trade of the sample was downloaded, after an
+independent review of the code:
+
+- Markets are selected on `latest_expiration_time`, which is fixed when a market is listed,
+  instead of on having settled by the download date. Selecting settled markets keeps the ones
+  that resolved early, and for a market asking whether something happens by a date, resolving
+  early usually means YES: that selection is a look-ahead on the outcome. Status must be final,
+  since Kalshi lists determined, disputed and amended results before the final one.
+- The periods are split by settlement date instead of trade date. With a trade-date split, a
+  market traded on both sides of 1 May put one outcome in both periods, and the two tests were
+  not independent.
+- Data validity checks and the write-once gate, so that missing data cannot be reported as the
+  absence of an edge, and a restart cannot change the gate the paper maker trades.
+- Ticks below a price and fees: a quote one tick below an ask of 0.90 on a tapered grid is
+  0.899 (step 0.001 below 0.90), not 0.89; only `quadratic_with_maker_fees` charges makers
+  (`quadratic_with_combo_maker_fees` concerns multivariate markets, which are excluded).
+- Forward test: cancels wait one second like new quotes, a slow maker cannot pull a quote
+  faster than it posts one; the universe uses the earlier of close and expected expiration,
+  because mention markets carry an expected expiration two weeks after the event they settle
+  on; settlement waits for a final status.
+- Known differences between B and the PENNY rule, stated rather than fixed: B assumes the book
+  had room for an improved quote, while PENNY joins the best price when the spread is one tick;
+  the forward universe is the 400 most active markets closing within 7 days, while the cells
+  pool all horizons.
 
 ## References
 
