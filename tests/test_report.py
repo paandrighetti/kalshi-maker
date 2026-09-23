@@ -129,12 +129,73 @@ def test_forward_report_end_to_end(tmp_path):
     ]
     write_fills(db, fills, infos, "run")
     db.executemany(
-        "INSERT INTO settlements VALUES (?,?,?,?)",
-        [(f"T{i}", "yes" if i % 10 == 0 else "no", 10**9, 10**9) for i in range(40)],
+        "INSERT INTO settlements VALUES (?,?,?,?,?)",
+        [(f"T{i}", "yes" if i % 10 == 0 else "no", "finalized", 10**9, 10**9) for i in range(40)],
     )
-    db.execute("INSERT INTO cycles VALUES (1, 2.5, 10, 20, 30, 4, 1, 12)")
+    db.execute("INSERT INTO cycles VALUES (1, 2.5, 10, 20, 30, 4, 1, 12, 0.8, '')")
     db.commit()
     text, digest = report.forward_report(d)
     # 36 fills keep 0.20, 4 lose 0.80 on 10 contracts: (72 - 32) / 400 = 10 cents per contract
     assert "10.000 cents per contract" in text
     assert "PENNY: 40 ev" in digest
+
+
+def test_void_results_release_risk_and_carry_no_pnl():
+    rows = [
+        {
+            "ts_us": 1,
+            "ticker": "A",
+            "event": "E",
+            "price": 0.01,
+            "qty": 100.0,
+            "result": "void",
+            "settled_us": 3,
+        },
+    ] + [
+        {
+            "ts_us": 2 + i,
+            "ticker": f"B{i}",
+            "event": "E",
+            "price": 0.01,
+            "qty": 100.0,
+            "result": "no",
+        }
+        for i in range(5)
+    ]
+    f = fills_frame(rows)
+    assert np.isnan(f.loc[f["ticker"] == "A", "pnl"]).all()
+    assert bool(f.loc[f["ticker"] == "A", "closed"].iloc[0])
+    sv = report.strategy_view(f, Q)
+    # the void at 3 frees its 99 USD, so B0..B4 all fit under the 500 USD per event
+    assert np.allclose(sv[sv["ticker"] != "A"]["qty"], 100.0)
+
+
+def test_fee_is_recomputed_for_the_contracts_kept():
+    rows = [
+        {"ts_us": 0, "ticker": "A", "price": 0.5, "qty": 90.0, "result": "no", "fee_rate": 0.0175},
+        {"ts_us": 1, "ticker": "A", "price": 0.5, "qty": 30.0, "result": "no", "fee_rate": 0.0175},
+    ]
+    sv = report.strategy_view(fills_frame(rows), Q)
+    kept = sv.iloc[1]
+    assert kept["qty"] == 10.0
+    # 10 x 0.5 = 5.00 gross, fee ceil(0.0175 x 10 x 0.25 x 100) / 100 = 0.05
+    assert np.isclose(kept["pnl"], 5.0 - 0.05)
+
+
+def test_idle_reasons(tmp_path):
+    for gate, expect in (
+        (
+            {
+                "valid": False,
+                "invalid_reasons": ["3.0% of sampled hours returned no trade"],
+                "qualifying": [],
+            },
+            "validity checks",
+        ),
+        ({"valid": True, "replication_fails": True, "qualifying": Q}, "replication check"),
+        ({"valid": True, "qualifying": []}, "no pre-registered pair qualified"),
+        ({"valid": True, "qualifying": Q}, "has not started yet"),
+    ):
+        (tmp_path / "gate.json").write_text(json.dumps({"generated_at": "x", **gate}))
+        text, digest = report.forward_report(tmp_path)
+        assert expect in text and expect in digest, expect

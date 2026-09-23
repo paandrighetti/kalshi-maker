@@ -8,7 +8,7 @@ services:
     build: .
     env_file: .env
     command: ["kmaker", "pipeline"]
-    restart: on-failure
+    restart: on-failure:3
     mem_limit: 1200m
     volumes:
       - ./data:/data

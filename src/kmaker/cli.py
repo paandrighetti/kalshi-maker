@@ -22,8 +22,8 @@ from .paper import PaperMaker
 log = logging.getLogger("kmaker")
 
 
-def _client(s: Settings) -> Kalshi:
-    return Kalshi(s.api_bases, rate=s.rate)
+def _client(s: Settings, rate: float | None = None) -> Kalshi:
+    return Kalshi(s.api_bases, rate=s.rate if rate is None else rate)
 
 
 def _write(path: Path, text: str) -> None:
@@ -31,40 +31,53 @@ def _write(path: Path, text: str) -> None:
     path.write_text(text)
 
 
+def _gate_digest(gate: dict, summary: dict) -> str:
+    lines = ["kalshi-maker backtest (primary sample)"]
+    if not gate.get("valid", True):
+        return "\n".join(
+            lines + ["NO CONCLUSION, invalid data: " + "; ".join(gate.get("invalid_reasons", []))]
+        )
+    lines.append(f"pairs tested {gate['pairs_tested']}, qualifying {len(gate['qualifying'])}")
+    lines.append(
+        "replication check FAILED"
+        if summary["replication_fails"]
+        else "replication (A, cents per contract): "
+        + ", ".join(f"{k} {v['mean_c']:.2f}" for k, v in summary["replication_A_pooled"].items())
+    )
+    lines += [
+        f"{q['variant']} {q['category']} {q['side']} b{q['bucket']}: "
+        f"{q['exploration_mean_c']:.2f}c t{q['exploration_t']} / "
+        f"{q['confirmation_mean_c']:.2f}c t{q['confirmation_t']}"
+        for q in gate["qualifying"][:15]
+    ]
+    return "\n".join(lines)
+
+
 def cmd_pipeline(s: Settings, holdout: bool) -> None:
+    """Download, decide once, report; then the holdout. A restart resumes and never re-decides."""
+    gate_path = s.data_dir / "gate.json"
     with _client(s) as c:
         if not (s.data_dir / "series.parquet").exists():
             ingest.ingest_series(c, s.data_dir)
         residues = [PREREG.primary_residue] + ([PREREG.holdout_residue] if holdout else [])
         for residue in residues:
-            paths = ingest.ingest_trades(c, s.data_dir, residue, s.min_free_gb)
-            markets = ingest.ingest_markets(c, s.data_dir, paths)
-            ingest.ingest_missing_series(c, s.data_dir, markets)
-            ingest.write_manifest(
-                s.data_dir,
-                residue,
-                {"hours": len(paths), "markets": len(markets), "requests": c.requests},
-            )
             primary = residue == PREREG.primary_residue
+            label = "primary" if primary else f"r{residue}"
+            if primary and gate_path.exists():
+                log.info("gate.json exists: the primary sample was decided, skipping it")
+                continue
+            if not primary and (s.reports_dir / "backtest" / label / "summary.json").exists():
+                log.info("holdout already computed, skipping it")
+                continue
+            paths = ingest.ingest_trades(c, s.data_dir, residue, s.min_free_gb)
+            info = ingest.ingest_markets(c, s.data_dir, paths)
+            ingest.ingest_missing_series(c, s.data_dir)
+            ingest.write_manifest(s.data_dir, residue, {**info, "requests": c.requests})
             summary = backtest.run(s.data_dir, s.reports_dir, residue, write_gate=primary)
-            text = report.backtest_report(s.reports_dir, s.data_dir)
-            _write(s.reports_dir / "BACKTEST.md", text)
+            _write(s.reports_dir / "BACKTEST.md", report.backtest_report(s.reports_dir, s.data_dir))
             if primary:
-                gate = json.loads((s.data_dir / "gate.json").read_text())
-                lines = [
-                    "kalshi-maker backtest (primary sample)",
-                    f"pairs tested {gate['pairs_tested']}, qualifying {len(gate['qualifying'])}",
-                    "replication check FAILED"
-                    if summary["replication_fails"]
-                    else "replication check ok: " + json.dumps(summary["replication_A_pooled"]),
-                ]
-                lines += [
-                    f"{q['variant']} {q['category']} {q['side']} b{q['bucket']}: "
-                    f"{q['exploration_mean_c']:.2f}c t{q['exploration_t']} / "
-                    f"{q['confirmation_mean_c']:.2f}c t{q['confirmation_t']}"
-                    for q in gate["qualifying"][:15]
-                ]
-                telegram.send(s.telegram_token, s.telegram_chat, "\n".join(lines))
+                gate = json.loads(gate_path.read_text())
+                telegram.send(s.telegram_token, s.telegram_chat, _gate_digest(gate, summary))
             else:
                 telegram.send(
                     s.telegram_token,
@@ -87,11 +100,11 @@ def cmd_paper(s: Settings) -> None:
         log.info("no gate yet, waiting for the backtest")
         time.sleep(600)
     gate = json.loads(gate_path.read_text())
-    if not gate.get("qualifying") or gate.get("replication_fails"):
-        log.info("gate has no qualifying pair (or replication failed): idle")
+    if not gate.get("valid", True) or not gate.get("qualifying") or gate.get("replication_fails"):
+        log.info("the gate allows no quoting (invalid data, no pair, or failed replication): idle")
         while True:
             time.sleep(3600)
-    with _client(s) as c:
+    with _client(s, rate=s.rate_paper) as c:
         maker = PaperMaker(s, c, gate, _series_map(s, c))
         maker.run_forever()
 
@@ -137,7 +150,11 @@ def main(argv: list[str] | None = None) -> None:
     s = Settings()
     logging.basicConfig(level=s.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     if args.cmd == "pipeline":
-        cmd_pipeline(s, holdout=not args.no_holdout)
+        try:
+            cmd_pipeline(s, holdout=not args.no_holdout)
+        except Exception as exc:
+            telegram.send(s.telegram_token, s.telegram_chat, f"kalshi-maker pipeline failed: {exc}")
+            raise
     elif args.cmd == "backtest":
         backtest.run(
             s.data_dir,

@@ -13,6 +13,8 @@ import json
 from datetime import datetime
 from typing import Any
 
+from .config import PREREG
+
 TRADE_COLUMNS = ["ticker", "trade_id", "count", "yes_price", "taker_yes", "created_us", "is_block"]
 
 MARKET_COLUMNS = [
@@ -23,10 +25,13 @@ MARKET_COLUMNS = [
     "result",
     "close_us",
     "expected_expiration_us",
+    "latest_expiration_us",
     "settlement_us",
     "mve",
     "price_ranges",
 ]
+
+FINAL_STATUSES = PREREG.final_statuses
 
 
 def ts_us(value: str | None) -> int | None:
@@ -84,6 +89,7 @@ def normalize_market(m: dict[str, Any]) -> dict[str, Any]:
         "result": (m.get("result") or "").lower(),
         "close_us": ts_us(m.get("close_time")),
         "expected_expiration_us": ts_us(m.get("expected_expiration_time")),
+        "latest_expiration_us": ts_us(m.get("latest_expiration_time")),
         "settlement_us": ts_us(m.get("settlement_ts")),
         "mve": mve,
         "price_ranges": json.dumps(m.get("price_ranges") or []),
@@ -133,9 +139,25 @@ def maker_fee(rate: float, qty: float, price: float) -> float:
 
 
 def maker_fee_rate(fee_type: str | None, fee_multiplier: float | None, coef: float) -> float:
-    if fee_type and fee_type.startswith("quadratic_with"):
+    """Maker fee coefficient. Only `quadratic_with_maker_fees` charges makers on single markets;
+    the combo variant concerns multivariate markets, which are excluded (Amendment 2)."""
+    if fee_type == "quadratic_with_maker_fees":
         return coef * (1.0 if fee_multiplier is None else float(fee_multiplier))
     return 0.0
+
+
+def is_final(status: str | None, result: str | None) -> bool:
+    return (status or "") in FINAL_STATUSES and (result or "").lower() in ("yes", "no", "scalar")
+
+
+def closes_us(m: dict[str, Any]) -> int | None:
+    """When trading on a market is expected to end: the earlier of close and expected expiration.
+
+    Mention markets carry an expected expiration two weeks after the event they settle on, and
+    some sports markets a close a week after the match, so neither field alone is the horizon.
+    """
+    times = [t for t in (ts_us(m.get("close_time")), ts_us(m.get("expected_expiration_time"))) if t]
+    return min(times) if times else None
 
 
 def bucket_of(price: float, edges: tuple[float, ...]) -> int:

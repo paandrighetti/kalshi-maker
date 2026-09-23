@@ -93,13 +93,13 @@ class FakeClient:
         return iter(self.data[historical])
 
 
-def test_hour_straddling_the_cutoff_reads_both_tiers_and_filters():
+def test_every_hour_reads_live_then_historical_and_filters():
     h = int(datetime(2026, 7, 24, 0, tzinfo=timezone.utc).timestamp()) - 1800
-    cutoff = h + 1800
     hist = [
         _trade("KXM-1-A", "a", "2026-07-23T23:30:00.000001Z"),
         _trade("KXM-1-A", "b", "2026-07-23T23:29:59.999999Z"),  # before the hour
         _trade("KXS-1-A", "c", "2026-07-23T23:45:00Z"),  # sports series, dropped
+        _trade("KXM-1-A", "d", "2026-07-24T00:10:00Z"),  # moved to historical meanwhile
     ]
     live = [
         _trade("KXM-1-A", "d", "2026-07-24T00:10:00Z"),
@@ -107,15 +107,12 @@ def test_hour_straddling_the_cutoff_reads_both_tiers_and_filters():
         _trade("KXM-1-A", "e", "2026-07-24T00:30:00Z"),  # end of the hour, excluded
     ]
     fc = FakeClient(hist, live)
-    df = ingest.trades_for_hour(fc, h, cutoff, {"KXS"})
-    assert sorted(df["trade_id"]) == ["a", "d"]
-    assert [c[2] for c in fc.calls] == [True, False]
-    assert fc.calls[0][:2] == (h - 1, h + 3601)
+    rows = ingest.trades_for_hour(fc, h, {"KXS"})
+    assert sorted(r[1] for r in rows) == ["a", "d"]
+    assert fc.calls == [(h - 1, h + 3601, False), (h - 1, h + 3601, True)]
 
 
-def test_ingest_trades_is_resumable(tmp_path, monkeypatch):
-    d = tmp_path / "data"
-    d.mkdir()
+def _series_file(d):
     pd.DataFrame(
         [
             {
@@ -127,21 +124,54 @@ def test_ingest_trades_is_resumable(tmp_path, monkeypatch):
             }
         ]
     ).to_parquet(d / "series.parquet")
+
+
+class HourClient:
+    """One trade per hour from the live tier, none from the historical one."""
+
+    requests = 0
+
+    def __init__(self, empty=()):
+        self.n = 0
+        self.empty = set(empty)
+
+    def trades(self, min_ts, max_ts, historical):
+        self.n += 1
+        h = min_ts + 1
+        if historical or h in self.empty:
+            return iter([])
+        ts = datetime.fromtimestamp(h + 5, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return iter([_trade("KXM-1-A", f"id{h}", ts)])
+
+
+def test_ingest_trades_is_resumable(tmp_path, monkeypatch):
+    d = tmp_path / "data"
+    d.mkdir()
+    _series_file(d)
     hours = ingest.sampled_hours(PREREG.window_start, PREREG.window_end, PREREG.hour_mod, 0)[:3]
     monkeypatch.setattr(ingest, "sampled_hours", lambda *a: hours)
-
-    class C:
-        requests = 0
-
-        def cutoff(self):
-            return {"trades_created_ts": "2026-07-24T00:00:00Z"}
-
-        def trades(self, min_ts, max_ts, historical):
-            self.n = getattr(self, "n", 0) + 1
-            return iter([])
-
-    c = C()
+    c = HourClient()
+    paths = ingest.ingest_trades(c, d, 0)
+    assert c.n == 6 and all(p.exists() for p in paths)
+    assert ingest.hour_counts(d, 0) == {ingest.hour_key(h): 1 for h in hours}
     ingest.ingest_trades(c, d, 0)
-    assert c.n == 3
+    assert c.n == 6  # nothing downloaded twice
+
+
+def test_empty_hours_are_fetched_once_more_and_keep_their_schema(tmp_path, monkeypatch):
+    import duckdb
+
+    d = tmp_path / "data"
+    d.mkdir()
+    _series_file(d)
+    hours = ingest.sampled_hours(PREREG.window_start, PREREG.window_end, PREREG.hour_mod, 0)[:3]
+    monkeypatch.setattr(ingest, "sampled_hours", lambda *a: hours)
+    c = HourClient(empty={hours[0]})
     ingest.ingest_trades(c, d, 0)
-    assert c.n == 3  # nothing downloaded twice
+    assert c.n == 8  # 3 hours x 2 tiers, then the empty hour once more
+    assert ingest.hour_counts(d, 0)[ingest.hour_key(hours[0])] == 0
+    # an empty file first in the glob must not break the schema of the others
+    got = duckdb.sql(
+        f"SELECT count(*), any_value(ticker) FROM read_parquet('{d}/trades_r0/*.parquet')"
+    ).fetchone()
+    assert got == (2, "KXM-1-A")

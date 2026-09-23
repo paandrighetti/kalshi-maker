@@ -100,6 +100,19 @@ class Kalshi:
                 return
             query["cursor"] = cursor
 
+    def pages(
+        self, path: str, params: dict[str, Any] | None, key: str
+    ) -> Iterator[list[dict[str, Any]]]:
+        """Like `paginate`, one list per page, so a caller can spread a listing over time."""
+        query = dict(params or {})
+        while True:
+            data = self.get(path, query)
+            yield data.get(key) or []
+            cursor = data.get("cursor")
+            if not cursor:
+                return
+            query["cursor"] = cursor
+
     # endpoints -----------------------------------------------------------------------------
 
     def cutoff(self) -> dict[str, Any]:
@@ -127,8 +140,8 @@ class Kalshi:
         path = "/historical/markets" if historical else "/markets"
         return list(self.paginate(path, {"tickers": ",".join(tickers), "limit": 1000}, "markets"))
 
-    def open_markets(self) -> Iterator[dict[str, Any]]:
-        return self.paginate(
+    def open_market_pages(self) -> Iterator[list[dict[str, Any]]]:
+        return self.pages(
             "/markets", {"status": "open", "mve_filter": "exclude", "limit": 1000}, "markets"
         )
 

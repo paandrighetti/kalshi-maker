@@ -66,7 +66,14 @@ def backtest_report(reports_dir: Path, data_dir: Path) -> str:
         "",
     ]
     q = gate["qualifying"]
-    if q:
+    checks = summary.get("validity", {})
+    if not gate.get("valid", True):
+        out.append(
+            "No conclusion: the data failed the pre-registered validity checks ("
+            + "; ".join(gate.get("invalid_reasons", []))
+            + "). No pair was tested and the paper maker does not quote."
+        )
+    elif q:
         out.append(
             f"{len(q)} of {gate['pairs_tested']} pre-registered (variant, cell) pairs qualify: "
             "positive with t >= 2 in both the exploration and the confirmation samples."
@@ -104,9 +111,17 @@ def backtest_report(reports_dir: Path, data_dir: Path) -> str:
         if summary["replication_fails"]
         else "The pooled maker premium does not contradict the literature on this sample.",
         "",
-        "## Sample",
+        "## Sample and validity checks",
         "",
-        md_table(pd.DataFrame([summary["counts"]])),
+        f"Sampled hours: {checks.get('hours', 'n/a')}; empty "
+        f"{checks.get('empty_hour_share', float('nan')):.2%} (limit "
+        f"{PREREG.max_empty_hour_share:.0%}); trades without a market record "
+        f"{checks.get('unmatched_share', float('nan')):.2%} (limit "
+        f"{PREREG.max_unmatched_share:.0%}); eligible trades in non-final markets "
+        f"{checks.get('unsettled_share', float('nan')):.2%} (limit "
+        f"{PREREG.max_unsettled_share:.0%}).",
+        "",
+        md_table(pd.DataFrame(sorted(summary["counts"].items()), columns=["count", "value"])),
         "",
         md_table(volume, {"taker_yes_share": 3}),
         "",
@@ -141,18 +156,23 @@ def backtest_report(reports_dir: Path, data_dir: Path) -> str:
 # forward ---------------------------------------------------------------------------------------
 
 
-def load_forward(db_path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+def load_forward(db_path: Path) -> tuple[pd.DataFrame, pd.DataFrame, dict | None]:
     db = sqlite3.connect(db_path)
     fills = pd.read_sql_query("SELECT * FROM fills ORDER BY ts_us, id", db)
     cycles = pd.read_sql_query("SELECT * FROM cycles", db)
-    settle = pd.read_sql_query("SELECT * FROM settlements", db)
+    settle = pd.read_sql_query("SELECT ticker, result, settled_us FROM settlements", db)
+    meta = dict(db.execute("SELECT k, v FROM meta").fetchall())
     db.close()
-    fills = fills.merge(settle[["ticker", "result", "settled_us"]], on="ticker", how="left")
-    return fills, cycles
+    fills = fills.merge(settle, on="ticker", how="left")
+    traded_gate = json.loads(meta["gate"]) if "gate" in meta else None
+    return fills, cycles, traded_gate
 
 
 def with_pnl(fills: pd.DataFrame) -> pd.DataFrame:
+    """Settlement profit per fill. A final result other than yes or no (a void or a scalar
+    settlement) ends the position without a binary payoff: it is closed and excluded from PnL."""
     f = fills.copy()
+    closed = f["result"].notna() & (f["result"].astype(str) != "")
     settled = f["result"].isin(["yes", "no"])
     o = (f["result"] == "yes").astype(float)
     d = f["side"].map(SIDE_SIGN)
@@ -160,6 +180,7 @@ def with_pnl(fills: pd.DataFrame) -> pd.DataFrame:
     f["pnl"] = np.where(settled, f["qty"] * (d * (o - f["price"])) - np.array(fee), np.nan)
     f["risk_pc"] = np.where(f["side"] == "long_yes", f["price"], 1.0 - f["price"])
     f["settled"] = settled
+    f["closed"] = closed
     # clusters as in the backtest: category and UTC settlement date (trade date if unknown)
     when = pd.to_datetime(f["settled_us"].fillna(f["ts_us"]).astype("int64"), unit="us", utc=True)
     f["cluster"] = f["category"].astype(str) + "|" + when.dt.strftime("%Y-%m-%d")
@@ -167,7 +188,11 @@ def with_pnl(fills: pd.DataFrame) -> pd.DataFrame:
 
 
 def strategy_view(f: pd.DataFrame, qualifying: list[dict]) -> pd.DataFrame:
-    """Fills kept under the pre-registered position limits, applied in time order per variant."""
+    """Fills kept under the pre-registered position limits, applied in time order per variant.
+
+    Risk is released when a market closes (settled, void or scalar). A fill cut by a limit keeps
+    its price, and its fee is recomputed for the contracts kept.
+    """
     cells = {(q["variant"], q["category"], q["side"], int(q["bucket"])) for q in qualifying}
     keep_rows = []
     for variant, g in f.sort_values(["ts_us", "id"]).groupby("variant", sort=False):
@@ -177,15 +202,11 @@ def strategy_view(f: pd.DataFrame, qualifying: list[dict]) -> pd.DataFrame:
         open_risk = 0.0
         for _, r in g.iterrows():
             b = int(r["bucket"])
-            if (variant, r["category"], r["side"], b) not in cells and (
-                variant,
-                "ALL",
-                r["side"],
-                b,
-            ) not in cells:
+            in_gate = (variant, r["category"], r["side"], b) in cells
+            if not in_gate and (variant, "ALL", r["side"], b) not in cells:
                 continue
             while open_heap and open_heap[0][0] <= r["ts_us"]:
-                end, risk, ev = heapq.heappop(open_heap)
+                _end, risk, ev = heapq.heappop(open_heap)
                 open_risk -= risk
                 per_event[ev] = per_event.get(ev, 0.0) - risk
             room_m = PREREG.max_contracts_per_market - per_market.get(r["ticker"], 0.0)
@@ -198,12 +219,14 @@ def strategy_view(f: pd.DataFrame, qualifying: list[dict]) -> pd.DataFrame:
             per_market[r["ticker"]] = per_market.get(r["ticker"], 0.0) + qty
             per_event[r["event"]] = per_event.get(r["event"], 0.0) + risk
             open_risk += risk
-            end = r["settled_us"] if pd.notna(r["settled_us"]) else float("inf")
+            end = r["settled_us"] if r["closed"] and pd.notna(r["settled_us"]) else float("inf")
             heapq.heappush(open_heap, (end, risk, r["event"]))
             row = r.copy()
-            scale = qty / r["qty"]
             row["qty"] = qty
-            row["pnl"] = r["pnl"] * scale if pd.notna(r["pnl"]) else np.nan
+            if r["settled"]:
+                o = 1.0 if r["result"] == "yes" else 0.0
+                gross = qty * SIDE_SIGN[r["side"]] * (o - r["price"])
+                row["pnl"] = gross - maker_fee(r["fee_rate"], qty, r["price"])
             keep_rows.append(row)
     return pd.DataFrame(keep_rows)
 
@@ -223,7 +246,17 @@ def forward_status(settled: pd.DataFrame, first_fill_us: int, now_us: int) -> st
         return "success criterion met"
     if days >= 30 and t["mean_c"] < 0:
         return "abandon criterion met"
-    return "running"
+    return f"running, day {days:.0f} of the forward test"
+
+
+def _idle_reason(gate: dict) -> str | None:
+    if not gate.get("valid", True):
+        return "the data failed the validity checks (" + "; ".join(gate["invalid_reasons"]) + ")"
+    if gate.get("replication_fails"):
+        return "the replication check failed; the data handling must be audited"
+    if not gate["qualifying"]:
+        return "no pre-registered pair qualified"
+    return None
 
 
 def forward_report(data_dir: Path) -> tuple[str, str]:
@@ -238,10 +271,21 @@ def forward_report(data_dir: Path) -> tuple[str, str]:
         f"{len(gate['qualifying'])} qualifying pairs.",
         "",
     ]
-    if not db_path.exists() or not gate["qualifying"]:
-        text = "\n".join(head + ["No qualifying pair, nothing is quoted."]) + "\n"
-        return text, "kalshi-maker: no qualifying pair, the paper maker is idle."
-    fills, cycles = load_forward(db_path)
+    idle = _idle_reason(gate)
+    if idle:
+        text = "\n".join(head + [f"The paper maker does not quote: {idle}."]) + "\n"
+        return text, f"kalshi-maker: idle, {idle}."
+    if not db_path.exists():
+        text = "\n".join(head + ["The paper maker has not started yet."]) + "\n"
+        return text, "kalshi-maker: the paper maker has not started yet."
+    fills, cycles, traded_gate = load_forward(db_path)
+    if traded_gate is not None and traded_gate.get("generated_at") != gate["generated_at"]:
+        head += [
+            "Warning: gate.json differs from the gate the paper maker trades; the report "
+            "uses the traded one.",
+            "",
+        ]
+        gate = traded_gate
     if fills.empty:
         text = "\n".join(head + ["No fill yet."]) + "\n"
         return text, "kalshi-maker: running, no fill yet."
@@ -250,9 +294,10 @@ def forward_report(data_dir: Path) -> tuple[str, str]:
     out = list(head)
     digest = ["kalshi-maker forward"]
     for variant in sorted(f["variant"].unique()):
-        sv = strategy_view(f[f["variant"] == variant], gate["qualifying"])
+        fv = f[f["variant"] == variant]
+        sv = strategy_view(fv, gate["qualifying"])
         settled = sv[sv["settled"]] if not sv.empty else sv
-        status = forward_status(settled, int(f["ts_us"].min()), now_us)
+        status = forward_status(settled, int(fv["ts_us"].min()), now_us)
         out += [f"## {variant}", "", f"Status: {status}.", ""]
         if not settled.empty:
             rows = settled.assign(s=settled["pnl"], w=settled["qty"], n=1)
@@ -277,21 +322,17 @@ def forward_report(data_dir: Path) -> tuple[str, str]:
             )
         else:
             digest.append(f"{variant}: nothing settled yet")
-        open_ = sv[~sv["settled"]] if not sv.empty else sv
+        open_ = sv[~sv["closed"]] if not sv.empty else sv
         if not open_.empty:
             out += [
                 f"Open: {len(open_)} fills, {float((open_['qty'] * open_['risk_pc']).sum()):.2f}"
                 " USD at risk.",
                 "",
             ]
-        mech = (
-            f[f["variant"] == variant]
-            .groupby(["via", "improved"])
-            .agg(
-                fills=("qty", "size"),
-                contracts=("qty", "sum"),
-                mean_queue_ahead=("queue_ahead", "mean"),
-            )
+        mech = fv.groupby(["via", "improved"]).agg(
+            fills=("qty", "size"),
+            contracts=("qty", "sum"),
+            mean_queue_ahead=("queue_ahead", "mean"),
         )
         out += [
             "Fill mechanics (all fills, before limits):",
@@ -301,13 +342,15 @@ def forward_report(data_dir: Path) -> tuple[str, str]:
         ]
     if not cycles.empty:
         d = cycles["duration_s"]
+        errs = int((cycles["errors"].fillna("") != "").sum())
         out += [
             "## Cycles",
             "",
             f"{len(cycles)} cycles; duration median {d.median():.1f} s, 95th percentile "
             f"{d.quantile(0.95):.1f} s; median {cycles['active'].median():.0f} active markets, "
             f"{cycles['orders'].median():.0f} live quotes, {cycles['requests'].median():.0f} "
-            "requests per cycle.",
+            f"requests per cycle; median age of the newest trade at poll "
+            f"{cycles['trade_lag_s'].median():.1f} s; {errs} cycles with a failed stage.",
             "",
         ]
     return "\n".join(out) + "\n", "\n".join(digest)

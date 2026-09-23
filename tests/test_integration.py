@@ -6,8 +6,9 @@ from datetime import datetime, timezone
 
 import httpx
 import numpy as np
+import pytest
 
-from kmaker import backtest, ingest, report
+from kmaker import backtest, cli, ingest, report
 from kmaker.client import Kalshi
 from kmaker.config import PREREG, Settings
 from kmaker.paper import PaperMaker
@@ -18,13 +19,14 @@ def iso(ts: float) -> str:
 
 
 class FakeAPI:
-    """Serves /series, /historical/cutoff, trades and markets for a few sampled hours."""
+    """Serves /series, trades (live and historical tiers) and markets for a few hours."""
 
     def __init__(self, hours):
         rng = np.random.default_rng(3)
         self.cutoff = int(datetime(2026, 7, 24, tzinfo=timezone.utc).timestamp())
         self.trades = {True: [], False: []}
         self.markets = {True: {}, False: {}}
+        self.requests = 0
         n = 0
         for h in hours:
             for e in range(4):
@@ -38,6 +40,7 @@ class FakeAPI:
                     "result": "yes" if rng.random() < 0.1 else "no",
                     "close_time": iso(h + 7200),
                     "settlement_ts": iso(h + 7300),
+                    "latest_expiration_time": iso(h + 86400),
                     "price_ranges": [{"start": "0", "end": "1", "step": "0.01"}],
                 }
                 for k in range(6):
@@ -67,6 +70,7 @@ class FakeAPI:
                 )
 
     def handler(self, req: httpx.Request) -> httpx.Response:
+        self.requests += 1
         path, q = req.url.path.removeprefix("/v2"), req.url.params
         if path == "/series":
             return httpx.Response(
@@ -88,8 +92,6 @@ class FakeAPI:
                     ]
                 },
             )
-        if path == "/historical/cutoff":
-            return httpx.Response(200, json={"trades_created_ts": iso(self.cutoff)})
         if path in ("/historical/trades", "/markets/trades"):
             hist = path.startswith("/historical")
             lo, hi = int(q["min_ts"]), int(q["max_ts"])
@@ -111,44 +113,45 @@ class FakeAPI:
         return httpx.Response(404)
 
 
-def test_pipeline_to_report(tmp_path):
+@pytest.fixture
+def pipeline_env(tmp_path, monkeypatch):
     hours = ingest.sampled_hours(PREREG.window_start, PREREG.window_end, PREREG.hour_mod, 0)
     # a few hours on each side of the split and of the historical cutoff
     pick = [h for h in hours if h < 1767225600][:3] + [h for h in hours if h > 1785000000][:3]
+    monkeypatch.setattr(ingest, "sampled_hours", lambda *a: pick)
+    monkeypatch.setattr(backtest, "sampled_hours", lambda *a: pick)
     api = FakeAPI(pick)
-    data_dir, reports_dir = tmp_path / "data", tmp_path / "reports"
-    c = Kalshi(
-        ["https://k.test/v2"],
-        rate=0,
-        transport=httpx.MockTransport(api.handler),
-        sleep=lambda s: None,
-    )
-    ingest.ingest_series(c, data_dir)
-    import kmaker.ingest as ing
+    monkeypatch.setenv("KM_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("KM_REPORTS_DIR", str(tmp_path / "reports"))
 
-    orig = ing.sampled_hours
-    ing.sampled_hours = lambda *a: pick
-    try:
-        paths = ingest.ingest_trades(c, data_dir, 0)
-    finally:
-        ing.sampled_hours = orig
-    markets = ingest.ingest_markets(c, data_dir, paths)
-    assert len(paths) == 6 and len(markets) == 24
-    assert set(markets["result"]) <= {"yes", "no"}
-    summary = backtest.run(data_dir, reports_dir, 0, write_gate=True)
+    def fake_client(s, rate=None):
+        return Kalshi(
+            ["https://k.test/v2"],
+            rate=0,
+            transport=httpx.MockTransport(api.handler),
+            sleep=lambda s: None,
+        )
+
+    monkeypatch.setattr(cli, "_client", fake_client)
+    return api, tmp_path / "data", tmp_path / "reports"
+
+
+def test_pipeline_to_report_then_a_restart_changes_nothing(pipeline_env):
+    api, data_dir, reports_dir = pipeline_env
+    cli.cmd_pipeline(Settings(), holdout=False)
+    summary = json.loads((reports_dir / "backtest" / "primary" / "summary.json").read_text())
     assert summary["counts"]["trades"] == 144  # sports trades never written
-    assert summary["counts"]["prints_kept"] == 144
-    text = report.backtest_report(reports_dir, data_dir)
+    assert summary["counts"]["trades_ok"] == 144
+    # the markets settle within hours, so the only period with data is the one of each hour:
+    # both periods are present because the picked hours straddle the split
+    assert summary["validity"]["periods"] == ["confirmation", "exploration"]
+    gate = (data_dir / "gate.json").read_text()
+    text = (reports_dir / "BACKTEST.md").read_text()
     assert "Pre-registration SHA-256" in text and "## Verdict" in text
-    # resumable: a second run downloads nothing new
-    before = c.requests
-    ing.sampled_hours = lambda *a: pick
-    try:
-        ingest.ingest_trades(c, data_dir, 0)
-    finally:
-        ing.sampled_hours = orig
-    ingest.ingest_markets(c, data_dir, paths)
-    assert c.requests - before == 1  # only the cutoff lookup
+    before = api.requests
+    cli.cmd_pipeline(Settings(), holdout=False)
+    assert api.requests == before  # the primary sample is decided once, nothing is fetched
+    assert (data_dir / "gate.json").read_text() == gate
 
 
 class FakeLive:
@@ -164,15 +167,16 @@ class FakeLive:
             "yes_ask_size_fp": "30.00",
         }
         self.tape = []
-        self.result = ""
+        self.result, self.status = "", "active"
+        self.fail_trades = False
 
     def _market(self, ticker="KXM-E1-A"):
         return {
             "ticker": ticker,
             "event_ticker": "KXM-E1",
-            "status": "active",
-            "expected_expiration_time": iso(self.now + 3600),
-            "close_time": iso(self.now + 7200),
+            "status": self.status,
+            "close_time": iso(self.now + 3600),
+            "expected_expiration_time": iso(self.now + 20 * 86400),  # like mentions
             "volume_24h_fp": "500.00",
             "result": self.result,
             "settlement_ts": iso(self.now),
@@ -180,10 +184,9 @@ class FakeLive:
             **self.book,
         }
 
-    def open_markets(self):
+    def open_market_pages(self):
         self.requests += 1
-        yield self._market()
-        yield {**self._market("KXS-E9-A"), "event_ticker": "KXS-E9"}  # sports, filtered
+        yield [self._market(), {**self._market("KXS-E9-A"), "event_ticker": "KXS-E9"}]
 
     def updated_markets(self, min_updated_ts):
         self.requests += 1
@@ -195,13 +198,33 @@ class FakeLive:
 
     def recent_trades(self, min_ts):
         self.requests += 1
+        if self.fail_trades:
+
+            def broken():
+                yield from self.tape[:1]
+                raise RuntimeError("page 2 failed")
+
+            return broken()
         out, self.tape = self.tape, []
         return iter(out)
+
+
+def _trade(tid, price, qty):
+    return {
+        "ticker": "KXM-E1-A",
+        "trade_id": tid,
+        "count_fp": f"{qty:.2f}",
+        "yes_price_dollars": f"{price:.4f}",
+        "taker_outcome_side": "yes",
+        "created_time": iso(time.time()),
+        "is_block_trade": False,
+    }
 
 
 def test_paper_maker_cycles(tmp_path, monkeypatch):
     gate = {
         "generated_at": "x",
+        "valid": True,
         "qualifying": [
             {"variant": "PENNY", "category": "Mentions", "side": "short_yes", "bucket": 1},
             {"variant": "JOIN", "category": "Mentions", "side": "short_yes", "bucket": 1},
@@ -212,29 +235,48 @@ def test_paper_maker_cycles(tmp_path, monkeypatch):
     fake = FakeLive()
     series = {"KXM": ("Mentions", "quadratic", 1.0), "KXS": ("Sports", "quadratic", 1.0)}
     pm = PaperMaker(Settings(), fake, gate, series)
-    pm.cycle()  # discovers the market and posts PENNY at 0.19 and JOIN at 0.20 behind 30
+    pm.cycle()  # the listing completes, the market is quoted: PENNY 0.19, JOIN 0.20 behind 30
     assert pm.active == ["KXM-E1-A"]
     quotes = sorted((o.variant, o.price, o.queue_ahead) for o in pm.sim.live_orders("KXM-E1-A"))
     assert quotes == [("JOIN", 0.20, 30.0), ("PENNY", 0.19, 0.0)]
     time.sleep(1.1)  # let the quotes go live
-    fake.tape = [
-        {
-            "ticker": "KXM-E1-A",
-            "trade_id": "x1",
-            "count_fp": "40.00",
-            "yes_price_dollars": "0.2000",
-            "taker_outcome_side": "yes",
-            "created_time": iso(time.time()),
-            "is_block_trade": False,
-        }
-    ]
+
+    # a trade poll that fails on its second page loses nothing: the next poll sees the trade
+    fake.tape = [_trade("x1", 0.20, 40.0)]
+    fake.fail_trades = True
+    pm.cycle()
+    assert pm.db.execute("SELECT count(*) FROM fills").fetchone()[0] == 0
+    assert "trades" in pm.db.execute("SELECT errors FROM cycles ORDER BY ts_us DESC").fetchone()[0]
+    fake.fail_trades = False
     pm.cycle()
     fills = pm.db.execute("SELECT variant, price, qty FROM fills ORDER BY variant").fetchall()
     assert fills == [("JOIN", 0.2, 10.0), ("PENNY", 0.19, 10.0)]
-    # settlement: the market resolves NO and the report counts both fills
-    fake.result, fake.now = "no", time.time() - 7200
-    pm.last_settle = 0
+
+    # settlement waits for a final status
+    fake.result, fake.status = "no", "determined"
+    pm.check_settlements()
+    assert pm.db.execute("SELECT count(*) FROM settlements").fetchone()[0] == 0
+    fake.status = "finalized"
     pm.check_settlements()
     text, digest = report.forward_report(tmp_path)
     assert "PENNY" in digest and "JOIN" in digest
     assert "19.000 cents per contract" in text and "20.000 cents per contract" in text
+
+
+def test_tape_watchdog_pulls_quotes(tmp_path, monkeypatch):
+    gate = {
+        "generated_at": "x",
+        "valid": True,
+        "qualifying": [
+            {"variant": "PENNY", "category": "Mentions", "side": "short_yes", "bucket": 1}
+        ],
+    }
+    monkeypatch.setenv("KM_DATA_DIR", str(tmp_path))
+    fake = FakeLive()
+    pm = PaperMaker(Settings(), fake, gate, {"KXM": ("Mentions", "quadratic", 1.0)})
+    pm.cycle()
+    assert pm.sim.live_orders("KXM-E1-A")
+    fake.fail_trades, fake.tape = True, [_trade("y1", 0.30, 1.0)]
+    pm.last_tape_ok -= 1000  # blind for longer than the watchdog allows
+    pm.cycle()
+    assert pm.sim.live_orders("KXM-E1-A") == []

@@ -18,8 +18,11 @@ published maker premium is largest there.
 
 [PREREGISTRATION.md](PREREGISTRATION.md) fixes the sample, the statistics, the cells, the
 decision rule, the holdout and the forward test before any sample trade was downloaded. It was
-the first commit of this repository. Its SHA-256 is printed in every report and stored in
-`data/gate.json`; the constants it names live in `src/kmaker/config.py`, not in `.env`.
+the first commit of this repository, and its two amendments, both made before any download, are
+logged at its end with their reasons: a synthetic run and an independent review of the code
+found weaknesses in the inference and a look-ahead in the selection of markets. Its SHA-256 is
+printed in every report and stored in `data/gate.json`; the constants it names live in
+`src/kmaker/config.py`, not in `.env`.
 
 ## What runs
 
@@ -30,7 +33,9 @@ backtest (one shot, resumable)
             series dropped on write, then the markets of those trades
   backtest  DuckDB: taker orders and their levels, statistics A, B and C per
             (category, side, price bucket, sample), clustered by category and settlement date
-  gate      pairs that pass in both periods -> data/gate.json, reports/BACKTEST.md
+  checks    no gate if hours came back empty, trades lack a market record, eligible markets
+            are not final, or a period has no data (missing data never reads as "no edge")
+  gate      pairs that pass in both periods -> data/gate.json, written once, never rewritten
   holdout   the same on another twelfth of the hours, reported, never decides
 paper (continuous)
   waits for the gate; every 20 s: new trades from the public tape fill the virtual quotes,
@@ -50,8 +55,11 @@ otherwise, o the outcome and p the YES price:
 - C, the last order in the queue: only the levels a taker order emptied. Decides the JOIN
   variant. A lower bound, since sweeps are the most informed orders.
 
-A pair (variant, category, side, bucket) qualifies when it is positive with t >= 2 in the
-exploration period (trades before 1 May 2026) and in the confirmation period (after), each with
+Markets are selected on `latest_expiration_time` (on or before 15 September 2026), which is
+fixed at listing, rather than on having settled by the download date, which would keep the
+markets that resolved early. A pair (variant, category, side, bucket) qualifies when it is
+positive with t >= 2 in the exploration period (markets settled before 1 May 2026) and in the
+confirmation period (after), each with
 at least 30 clusters, 100 events, 500 contracts and 10 losing clusters. A cluster is a category
 and a settlement date, so markets that share a shock on one day count once. The paper maker
 quotes only qualifying pairs.
@@ -63,6 +71,11 @@ cp .env.example .env              # Telegram optional
 docker compose up -d --build      # backtest, paper and reporter
 docker compose logs -f backtest   # progress of the download, then the verdict
 ```
+
+`KM_RATE` (download, 6 requests per second) and `KM_RATE_PAPER` (paper maker, 4) keep the two
+well under Kalshi's basic limit of about 20 per second together. The backtest needs 4 GB of free
+disk for its DuckDB work file; the download stops below 3 GB. A failed pipeline sends a Telegram
+message and is restarted at most three times; every step resumes where it stopped.
 
 Without Docker: `pip install -e .[dev]`, then `kmaker pipeline`, `kmaker paper`,
 `kmaker report`, and `pytest -q`. `KM_DATA_DIR` and `KM_REPORTS_DIR` default to `data/` and
@@ -88,6 +101,14 @@ Without Docker: `pip install -e .[dev]`, then `kmaker pipeline`, `kmaker paper`,
   and it ignores that a cancellation ahead of a quote moves it forward.
 - The forward maker polls: a quote can stand for up to one cycle after the market moved, and is
   then filled against the crossing book. That is the cost of being slow, and it is counted.
+- B credits an improved price even where the spread was one tick and no improvement was
+  possible; the PENNY rule joins the best price there. The forward universe (the 400 most
+  active markets closing within 7 days) is narrower than the backtest's cells, which pool all
+  horizons; `horizon_expost.csv` shows how the premium varies with time to settlement.
+- The holdout draws other trades on the same markets: it tests the sampling of trades, not new
+  outcomes.
+- Fee types are today's; Kalshi does not publish their history, and it has added maker fees
+  over time, which makes the correction conservative for most series.
 - Kalshi restricts access by country. This project reads public market data only and places no
   order.
 

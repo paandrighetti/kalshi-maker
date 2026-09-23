@@ -22,7 +22,9 @@ def _utc(s: str) -> datetime:
 class Prereg:
     window_start: datetime = _utc("2025-12-01T00:00:00")
     window_end: datetime = _utc("2026-09-08T00:00:00")
-    split: datetime = _utc("2026-05-01T00:00:00")
+    split: datetime = _utc("2026-05-01T00:00:00")  # on settlement date (Amendment 2)
+    latest_expiration_cutoff: datetime = _utc("2026-09-15T00:00:00")
+    final_statuses: tuple[str, ...] = ("finalized", "settled")
     hour_mod: int = 12
     primary_residue: int = 0
     holdout_residue: int = 1
@@ -35,6 +37,10 @@ class Prereg:
     min_contracts: float = 500.0
     min_losing_clusters: int = 10
     min_t: float = 2.0
+    # data validity (Amendment 2)
+    max_empty_hour_share: float = 0.02
+    max_unmatched_share: float = 0.05
+    max_unsettled_share: float = 0.01
     # forward test
     quote_size: float = 10.0
     max_days_to_expiry: float = 7.0
@@ -52,7 +58,8 @@ PREREG = Prereg()
 class Settings:
     data_dir: Path = field(default_factory=lambda: Path(os.getenv("KM_DATA_DIR", "data")))
     reports_dir: Path = field(default_factory=lambda: Path(os.getenv("KM_REPORTS_DIR", "reports")))
-    rate: float = field(default_factory=lambda: float(os.getenv("KM_RATE", "8")))
+    rate: float = field(default_factory=lambda: float(os.getenv("KM_RATE", "6")))
+    rate_paper: float = field(default_factory=lambda: float(os.getenv("KM_RATE_PAPER", "4")))
     api_bases: tuple[str, ...] = field(
         default_factory=lambda: tuple(
             b.strip()

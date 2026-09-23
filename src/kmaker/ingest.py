@@ -1,9 +1,14 @@
 """Download the pre-registered sample: series, the trades of the sampled hours, their markets.
 
-Everything is resumable. Each sampled hour is one parquet file written atomically, so an
-interrupted run restarts at the first missing hour; markets are fetched only for tickers not yet
-stored with a final result. Sports series are dropped when trades are written, which keeps the
+Everything is resumable. Each sampled hour is one parquet file written atomically with a fixed
+schema, so an interrupted run restarts at the first missing hour, and an hour that came back
+empty is fetched once more before the run ends. Markets are fetched only for tickers not yet
+stored with a final status. Sports series are dropped when trades are written, which keeps the
 files small (sports is most of Kalshi's volume and is excluded by the pre-registration).
+
+Kalshi serves trades older than a moving cutoff only from `/historical/trades` and newer ones
+only from `/markets/trades`. Every hour is read from both, live first: a trade that moves to the
+historical tier between the two reads is then still seen once, and duplicates are removed by id.
 """
 
 from __future__ import annotations
@@ -18,12 +23,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from .client import Kalshi
 from .config import PREREG
 from .schema import (
     MARKET_COLUMNS,
-    TRADE_COLUMNS,
+    is_final,
     normalize_market,
     normalize_trade,
     parse_ranges,
@@ -33,6 +40,38 @@ from .schema import (
 log = logging.getLogger(__name__)
 
 MARKET_BATCH = 50
+MARKET_PART_ROWS = 20_000
+
+TRADE_SCHEMA = pa.schema(
+    [
+        ("ticker", pa.string()),
+        ("trade_id", pa.string()),
+        ("count", pa.float64()),
+        ("yes_price", pa.float64()),
+        ("taker_yes", pa.bool_()),
+        ("created_us", pa.int64()),
+        ("is_block", pa.bool_()),
+    ]
+)
+MARKET_SCHEMA = pa.schema(
+    [
+        ("ticker", pa.string()),
+        ("event_ticker", pa.string()),
+        ("series", pa.string()),
+        ("status", pa.string()),
+        ("result", pa.string()),
+        ("close_us", pa.int64()),
+        ("expected_expiration_us", pa.int64()),
+        ("latest_expiration_us", pa.int64()),
+        ("settlement_us", pa.int64()),
+        ("mve", pa.bool_()),
+        ("price_ranges", pa.string()),
+    ]
+)
+RANGE_SCHEMA = pa.schema(
+    [("ticker", pa.string()), ("lo", pa.float64()), ("hi", pa.float64()), ("step", pa.float64())]
+)
+DEFAULT_RANGES = [(0.0, 1.0, 0.01)]
 
 
 def hour_key(hour_start: int) -> str:
@@ -54,11 +93,20 @@ def sampled_hours(start: datetime, end: datetime, mod: int, residue: int) -> lis
     return hours
 
 
-def _write_atomic(df: pd.DataFrame, path: Path) -> None:
+def _write_table(table: pa.Table, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    df.to_parquet(tmp, index=False)
+    pq.write_table(table, tmp)
     os.replace(tmp, path)
+
+
+def write_rows(rows: list, schema: pa.Schema, path: Path) -> None:
+    """Rows (tuples in schema order, or dicts) to parquet with a fixed schema, even when empty."""
+    if rows and isinstance(rows[0], dict):
+        cols = {f.name: [r[f.name] for r in rows] for f in schema}
+    else:
+        cols = {f.name: [r[i] for r in rows] for i, f in enumerate(schema)}
+    _write_table(pa.table(cols, schema=schema), path)
 
 
 def free_gb(path: Path) -> float:
@@ -70,11 +118,12 @@ def free_gb(path: Path) -> float:
 
 
 def _series_row(s: dict) -> dict:
+    mult = s.get("fee_multiplier")
     return {
         "series": s.get("ticker", ""),
         "category": s.get("category") or "",
         "fee_type": s.get("fee_type") or "",
-        "fee_multiplier": float(s.get("fee_multiplier") or 1.0),
+        "fee_multiplier": 1.0 if mult is None else float(mult),
         "title": s.get("title") or "",
     }
 
@@ -82,7 +131,8 @@ def _series_row(s: dict) -> dict:
 def ingest_series(client: Kalshi, data_dir: Path) -> pd.DataFrame:
     rows = [_series_row(s) for s in client.series() if s.get("ticker")]
     df = pd.DataFrame(rows).drop_duplicates("series")
-    _write_atomic(df, data_dir / "series.parquet")
+    data_dir.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(data_dir / "series.parquet", index=False)
     log.info("series: %d, categories: %s", len(df), sorted(df["category"].unique()))
     return df
 
@@ -91,159 +141,183 @@ def load_series(data_dir: Path) -> pd.DataFrame:
     return pd.read_parquet(data_dir / "series.parquet")
 
 
-def ingest_missing_series(client: Kalshi, data_dir: Path, markets: pd.DataFrame) -> int:
-    """Fetch one by one the series of downloaded markets that the listing did not return."""
-    series = load_series(data_dir)
-    missing = sorted(set(markets["series"]) - set(series["series"]))
-    rows = [_series_row(s) for s in map(client.series_one, missing) if s and s.get("ticker")]
-    if rows:
-        df = pd.concat([series, pd.DataFrame(rows)], ignore_index=True).drop_duplicates("series")
-        _write_atomic(df, data_dir / "series.parquet")
-    log.info("series missing from the listing: %d, fetched: %d", len(missing), len(rows))
-    return len(rows)
-
-
 def excluded_series(series: pd.DataFrame, excluded: Iterable[str]) -> set[str]:
     excluded = set(excluded)
     return set(series.loc[series["category"].isin(excluded), "series"])
 
 
+def ingest_missing_series(client: Kalshi, data_dir: Path) -> int:
+    """Fetch one by one the series of downloaded markets that the listing did not return."""
+    series = load_series(data_dir)
+    in_markets: set[str] = set()
+    for p in sorted((data_dir / "markets").glob("*.parquet")):
+        in_markets.update(pq.read_table(p, columns=["series"]).column("series").to_pylist())
+    missing = sorted(in_markets - set(series["series"]))
+    rows = [_series_row(s) for s in map(client.series_one, missing) if s and s.get("ticker")]
+    if rows:
+        df = pd.concat([series, pd.DataFrame(rows)], ignore_index=True).drop_duplicates("series")
+        df.to_parquet(data_dir / "series.parquet", index=False)
+    log.info("series missing from the listing: %d, fetched: %d", len(missing), len(rows))
+    return len(rows)
+
+
 # trades ------------------------------------------------------------------------------------
 
 
-def trades_for_hour(
-    client: Kalshi, hour_start: int, cutoff_s: int, drop_series: set[str]
-) -> pd.DataFrame:
+def trades_for_hour(client: Kalshi, hour_start: int, drop_series: set[str]) -> list[tuple]:
     """All trades created in [hour_start, hour_start + 3600), non-excluded series only.
 
-    Trades created before Kalshi's historical cutoff are served by `/historical/trades`, later
-    ones by `/markets/trades`; an hour straddling the cutoff is read from both. Bounds are
-    widened by a second on each side and enforced locally on microsecond timestamps, and trades
-    are deduplicated by id, so boundary semantics of `min_ts` / `max_ts` do not matter.
+    Bounds are widened by a second on each side and enforced locally on microsecond timestamps,
+    so the boundary semantics of `min_ts` and `max_ts` do not matter.
     """
     lo, hi = hour_start, hour_start + 3600
-    sources = []
-    if lo < cutoff_s:
-        sources.append(True)
-    if hi > cutoff_s:
-        sources.append(False)
+    seen: set[str] = set()
     rows = []
-    for historical in sources:
+    for historical in (False, True):  # live first, see the module docstring
         for t in client.trades(lo - 1, hi + 1, historical=historical):
             row = normalize_trade(t)
-            if row is None or series_of(row[0]) in drop_series:
+            if row is None or row[1] in seen:
+                continue
+            seen.add(row[1])
+            if series_of(row[0]) in drop_series:
                 continue
             if lo * 1_000_000 <= row[5] < hi * 1_000_000:
                 rows.append(row)
-    df = pd.DataFrame(rows, columns=TRADE_COLUMNS)
-    return df.drop_duplicates("trade_id", keep="first") if len(df) else df
+    return rows
+
+
+def _hours_manifest(data_dir: Path, residue: int) -> Path:
+    return data_dir / f"hours_r{residue}.json"
+
+
+def hour_counts(data_dir: Path, residue: int) -> dict[str, int]:
+    path = _hours_manifest(data_dir, residue)
+    return json.loads(path.read_text()) if path.exists() else {}
 
 
 def ingest_trades(
     client: Kalshi, data_dir: Path, residue: int, min_free_gb: float = 3.0
 ) -> list[Path]:
-    series = load_series(data_dir)
-    drop = excluded_series(series, PREREG.excluded_categories)
-    cutoff = client.cutoff()
-    cutoff_s = int(
-        datetime.fromisoformat(cutoff["trades_created_ts"].replace("Z", "+00:00")).timestamp()
-    )
+    drop = excluded_series(load_series(data_dir), PREREG.excluded_categories)
     hours = sampled_hours(PREREG.window_start, PREREG.window_end, PREREG.hour_mod, residue)
     out_dir = data_dir / f"trades_r{residue}"
-    done = 0
-    for i, h in enumerate(hours):
-        path = out_dir / f"{hour_key(h)}.parquet"
-        if path.exists():
-            done += 1
-            continue
+    manifest = _hours_manifest(data_dir, residue)
+    counts = hour_counts(data_dir, residue)
+
+    def fetch(h: int) -> None:
         if free_gb(data_dir) < min_free_gb:
             raise RuntimeError(f"less than {min_free_gb} GB free on {data_dir}, stopping")
-        df = trades_for_hour(client, h, cutoff_s, drop)
-        _write_atomic(df, path)
-        done += 1
+        rows = trades_for_hour(client, h, drop)
+        write_rows(rows, TRADE_SCHEMA, out_dir / f"{hour_key(h)}.parquet")
+        counts[hour_key(h)] = len(rows)
+        manifest.write_text(json.dumps(counts, sort_keys=True))
+
+    for i, h in enumerate(hours):
+        if hour_key(h) in counts and (out_dir / f"{hour_key(h)}.parquet").exists():
+            continue
+        fetch(h)
         if i % 20 == 0:
             log.info(
-                "trades r%d: %d/%d hours, last %s: %d rows, %d requests",
+                "trades r%d: hour %d of %d (%s): %d rows, %d requests so far",
                 residue,
-                done,
+                i + 1,
                 len(hours),
                 hour_key(h),
-                len(df),
+                counts[hour_key(h)],
                 client.requests,
             )
-    log.info("trades r%d complete: %d hours", residue, len(hours))
-    return sorted(out_dir.glob("*.parquet"))
+    for h in hours:  # one more attempt for every hour that came back empty
+        if counts.get(hour_key(h), 0) == 0:
+            fetch(h)
+    empty = sum(1 for h in hours if counts.get(hour_key(h), 0) == 0)
+    log.info("trades r%d complete: %d hours, %d empty", residue, len(hours), empty)
+    return [out_dir / f"{hour_key(h)}.parquet" for h in hours]
 
 
 # markets -----------------------------------------------------------------------------------
 
 
+def _final_tickers(data_dir: Path) -> set[str]:
+    final: set[str] = set()
+    for p in sorted((data_dir / "markets").glob("*.parquet")):
+        t = pq.read_table(p, columns=["ticker", "status", "result"]).to_pydict()
+        for ticker, status, result in zip(t["ticker"], t["status"], t["result"], strict=True):
+            if is_final(status, result):
+                final.add(ticker)
+            else:
+                final.discard(ticker)  # a later part re-fetched it before it was final
+    return final
+
+
 def _tickers_in(paths: Iterable[Path]) -> set[str]:
     tickers: set[str] = set()
     for p in paths:
-        tickers.update(pd.read_parquet(p, columns=["ticker"])["ticker"].unique())
+        if p.exists():
+            tickers.update(pq.read_table(p, columns=["ticker"]).column("ticker").to_pylist())
     return tickers
 
 
-def load_markets(data_dir: Path) -> pd.DataFrame:
-    parts = sorted((data_dir / "markets").glob("*.parquet"))
-    if not parts:
-        return pd.DataFrame(columns=MARKET_COLUMNS)
-    df = pd.concat([pd.read_parquet(p) for p in parts], ignore_index=True)
-    # later parts supersede earlier ones for the same ticker (a market re-fetched once settled)
-    return df.drop_duplicates("ticker", keep="last").reset_index(drop=True)
+def ingest_markets(client: Kalshi, data_dir: Path, trade_paths: Iterable[Path]) -> dict:
+    """Market records for every ticker in the trade files, in numbered parts.
 
-
-def ingest_markets(client: Kalshi, data_dir: Path, trade_paths: Iterable[Path]) -> pd.DataFrame:
+    A later part supersedes an earlier one for the same ticker. Price grids other than the plain
+    one-cent grid are written to `ranges/` under the same part number.
+    """
     wanted = _tickers_in(trade_paths)
-    have = load_markets(data_dir)
-    final = set(have.loc[have["result"].isin(["yes", "no", "scalar"]), "ticker"])
+    final = _final_tickers(data_dir)
     todo = sorted(wanted - final)
     log.info(
         "markets: %d tickers in trades, %d final, %d to fetch", len(wanted), len(final), len(todo)
     )
     out_dir = data_dir / "markets"
-    start_part = len(list(out_dir.glob("*.parquet"))) if out_dir.exists() else 0
-    part_rows: list[dict] = []
-    part = start_part
+    part = len(list(out_dir.glob("*.parquet"))) if out_dir.exists() else 0
+    rows: list[dict] = []
+    not_found = 0
+
+    def flush() -> None:
+        nonlocal rows, part
+        if not rows:
+            return
+        write_rows(rows, MARKET_SCHEMA, out_dir / f"part-{part:05d}.parquet")
+        ranges = []
+        for r in rows:
+            parsed = parse_ranges(r["price_ranges"])
+            if parsed != DEFAULT_RANGES:
+                ranges += [(r["ticker"], lo, hi, step) for lo, hi, step in parsed]
+        write_rows(ranges, RANGE_SCHEMA, data_dir / "ranges" / f"part-{part:05d}.parquet")
+        rows, part = [], part + 1
+
     for i in range(0, len(todo), MARKET_BATCH):
         batch = todo[i : i + MARKET_BATCH]
         got = {m["ticker"]: m for m in client.markets_by_tickers(batch, historical=False)}
         missing = [t for t in batch if t not in got]
         if missing:
-            got.update(
-                {m["ticker"]: m for m in client.markets_by_tickers(missing, historical=True)}
-            )
-        part_rows.extend(normalize_market(m) for m in got.values())
-        if len(part_rows) >= 20_000 or i + MARKET_BATCH >= len(todo):
-            _write_atomic(
-                pd.DataFrame(part_rows, columns=MARKET_COLUMNS),
-                out_dir / f"part-{part:05d}.parquet",
-            )
+            hist = client.markets_by_tickers(missing, historical=True)
+            got.update({m["ticker"]: m for m in hist})
+        not_found += sum(1 for t in batch if t not in got)
+        rows.extend(normalize_market(m) for m in got.values())
+        if len(rows) >= MARKET_PART_ROWS:
+            flush()
             log.info(
-                "markets: %d/%d fetched, %d requests",
-                min(i + MARKET_BATCH, len(todo)),
+                "markets: %d of %d fetched, %d requests so far",
+                i + len(batch),
                 len(todo),
                 client.requests,
             )
-            part_rows, part = [], part + 1
-    return load_markets(data_dir)
-
-
-def ranges_table(markets: pd.DataFrame) -> pd.DataFrame:
-    """One row per (ticker, start, end, step) from each market's `price_ranges`."""
-    rows = []
-    for ticker, pr in zip(markets["ticker"], markets["price_ranges"], strict=True):
-        for start, end, step in parse_ranges(pr):
-            rows.append((ticker, start, end, step))
-    return pd.DataFrame(rows, columns=["ticker", "lo", "hi", "step"])
+    flush()
+    return {"tickers": len(wanted), "fetched": len(todo), "not_found": not_found}
 
 
 def write_manifest(data_dir: Path, residue: int, extra: dict) -> None:
     path = data_dir / f"manifest_r{residue}.json"
-    path.write_text(
-        json.dumps(
-            {"residue": residue, "written_at": datetime.now(timezone.utc).isoformat(), **extra},
-            indent=2,
-        )
-    )
+    stamp = datetime.now(timezone.utc).isoformat()
+    path.write_text(json.dumps({"residue": residue, "written_at": stamp, **extra}, indent=2))
+
+
+def load_markets(data_dir: Path) -> pd.DataFrame:
+    """All market parts in memory, later parts first; for small data (tests, inspection)."""
+    parts = sorted((data_dir / "markets").glob("*.parquet"))
+    if not parts:
+        return pd.DataFrame(columns=MARKET_COLUMNS)
+    df = pd.concat([pd.read_parquet(p) for p in parts], ignore_index=True)
+    return df.drop_duplicates("ticker", keep="last").reset_index(drop=True)

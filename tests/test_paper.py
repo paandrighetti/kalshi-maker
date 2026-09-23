@@ -108,7 +108,7 @@ def test_unchanged_target_keeps_queue_position_and_moved_target_requeues():
     assert same is o and same.queue_ahead == 4.0
     s.on_book(info(), (0.40, 7.0, 0.47, 12.0), 120 * S, S)  # the ask moved away
     (new,) = s.live_orders("M-1-A")
-    assert new is not o and o.cancel_us == 120 * S
+    assert new is not o and o.cancel_us == 121 * S  # a cancel waits the same second
     assert (new.price, new.queue_ahead, new.live_us) == (0.47, 12.0, 121 * S)
 
 
@@ -117,11 +117,12 @@ def test_canceled_quote_still_fills_trades_printed_before_the_cancel():
     s.on_book(info(), (0.40, 7.0, 0.45, 9.0), 100 * S, S)
     (o,) = s.live_orders("M-1-A")
     s.on_book(info(), (0.40, 7.0, 0.43, 9.0), 110 * S, S)  # someone improved; requote
-    assert o.cancel_us == 110 * S
+    assert o.cancel_us == 111 * S
     fills = s.on_taker_order(TakerOrder("M-1-A", 105 * S, True, [(0.45, 3.0)]))
     assert [(f.oid, f.qty) for f in fills] == [(o.oid, 3.0)]
-    fills = s.on_taker_order(TakerOrder("M-1-A", 110 * S + 500_000, True, [(0.43, 3.0)]))
-    assert fills == []  # the new quote at 0.42 goes live at 111 s
+    # during the second after the book the old quote is still there: a taker at 0.44 hits it
+    fills = s.on_taker_order(TakerOrder("M-1-A", 110 * S + 500_000, True, [(0.44, 3.0)]))
+    assert [(f.oid, f.price, f.qty) for f in fills] == [(o.oid, 0.44, 3.0)]
     fills = s.on_taker_order(TakerOrder("M-1-A", 111 * S, True, [(0.43, 3.0)]))
     assert [(f.price, f.qty) for f in fills] == [(0.42, 3.0)]
 
@@ -132,7 +133,7 @@ def test_stale_quote_crossed_by_the_book_is_picked_off():
     (o,) = s.live_orders("M-1-A")
     fills = s.on_book(info(), (0.50, 4.0, 0.55, 9.0), 130 * S, S)
     assert [(f.via, f.price, f.qty) for f in fills] == [("cross", 0.44, 4.0)]
-    assert o.cancel_us == 130 * S
+    assert o.cancel_us == 131 * S
     (new,) = s.live_orders("M-1-A")
     assert new.price == 0.54
 
