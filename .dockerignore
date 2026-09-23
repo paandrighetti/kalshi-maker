@@ -1,0 +1,9 @@
+# The image needs only pyproject.toml, README.md, PREREGISTRATION.md and src/. Keep the
+# downloaded data (several GB), the reports and the secrets out of the build context.
+.git
+.env
+data/
+reports/
+**/__pycache__
+**/*.egg-info
+build/

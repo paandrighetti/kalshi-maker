@@ -21,5 +21,7 @@ def send(token: str, chat_id: str, text: str) -> bool:
         r.raise_for_status()
         return True
     except httpx.HTTPError as exc:
-        log.warning("telegram send failed: %s", exc)
+        # not the exception text: it quotes the URL, which holds the token
+        status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else ""
+        log.warning("telegram send failed: %s %s", type(exc).__name__, status)
         return False

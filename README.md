@@ -68,7 +68,9 @@ quotes only qualifying pairs.
 
 ```
 cp .env.example .env              # Telegram optional
-docker compose up -d --build      # backtest, paper and reporter
+docker compose build
+docker compose run --rm reporter kmaker report   # sends the progress digest now: Telegram check
+docker compose up -d              # backtest, paper and reporter
 docker compose logs -f backtest   # progress of the download, then the verdict
 ```
 

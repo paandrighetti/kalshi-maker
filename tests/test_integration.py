@@ -1,6 +1,7 @@
 """End-to-end wiring against a fake Kalshi API: pipeline to report, and paper maker cycles."""
 
 import json
+import logging
 import time
 from datetime import datetime, timezone
 
@@ -442,6 +443,28 @@ def test_pending_digest_reports_progress(pipeline_env):
     (data_dir / "hours_r0.json").write_text(json.dumps({"2026-01-01T00": 5}))
     text = cli._pending_digest(Settings())
     assert "no gate yet; 1 of" in text and "last progress" in text
+
+
+def test_the_telegram_token_stays_out_of_the_logs(pipeline_env, monkeypatch, caplog):
+    # httpx logs each request URL at INFO and quotes it in its errors; Telegram URLs hold the token
+    sent = []
+
+    def post(url, **kw):  # Telegram refuses the message
+        sent.append(kw["json"]["text"])
+        with httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(401))) as c:
+            return c.post(url, json=kw["json"])
+
+    monkeypatch.setattr(httpx, "post", post)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:SECRET")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "42")
+    caplog.set_level(logging.INFO)
+    try:
+        cli.main(["report"])
+    finally:
+        logging.getLogger("httpx").setLevel(logging.NOTSET)
+    assert "download not started" in sent[0]
+    assert "telegram send failed: HTTPStatusError 401" in caplog.text
+    assert "SECRET" not in caplog.text
 
 
 def test_pipeline_forever_retries_failures_then_idles(monkeypatch):

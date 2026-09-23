@@ -186,10 +186,14 @@ def _pending_digest(s: Settings) -> str:
     )
     done = ingest.hour_counts(s.data_dir, PREREG.primary_residue)
     path = s.data_dir / f"hours_r{PREREG.primary_residue}.json"
-    age = (time.time() - path.stat().st_mtime) / 3600 if path.exists() else float("nan")
+    progress = (
+        f"last progress {(time.time() - path.stat().st_mtime) / 3600:.1f} h ago"
+        if path.exists()
+        else "download not started"
+    )
     lines = [
         f"kalshi-maker: no gate yet; {len(done)} of {len(hours)} sampled hours downloaded, "
-        f"last progress {age:.1f} h ago"
+        + progress
     ]
     summary = s.reports_dir / "backtest" / "primary" / "summary.json"
     if summary.exists():
@@ -264,6 +268,8 @@ def main(argv: list[str] | None = None) -> None:
     args = p.parse_args(argv)
     s = Settings()
     logging.basicConfig(level=s.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    # httpx logs every request at INFO: several lines a second, and Telegram URLs hold the token
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     if args.cmd == "pipeline":
         pipeline_forever(s, holdout=not args.no_holdout)
     elif args.cmd == "backtest":
