@@ -22,7 +22,7 @@ def _utc(s: str) -> datetime:
 class Prereg:
     window_start: datetime = _utc("2025-12-01T00:00:00")
     window_end: datetime = _utc("2026-09-08T00:00:00")
-    split: datetime = _utc("2026-05-01T00:00:00")  # on settlement date (Amendment 2)
+    split: datetime = _utc("2026-05-01T00:00:00")  # on latest_expiration_time (Amendment 3)
     latest_expiration_cutoff: datetime = _utc("2026-09-15T00:00:00")
     final_statuses: tuple[str, ...] = ("finalized", "settled")
     hour_mod: int = 12
