@@ -1,0 +1,132 @@
+{
+  "label": "primary",
+  "residue": 0,
+  "generated_at": "2026-09-24T11:20:36+00:00",
+  "prereg_sha256": "02e4f9180ac2b8b08b46401119b2e9bce9614561dbfd912b78dc922045da8f45",
+  "counts": {
+    "trades_unknown_series": 3118,
+    "trades_not_final": 5,
+    "trades_block": 2,
+    "trades_multivariate": 9967010,
+    "trades_ok": 41722550,
+    "trades_not_binary": 12111,
+    "trades_late_expiration": 1270909,
+    "trades": 52975705,
+    "levels": 28674589,
+    "orders": 24149206,
+    "events": 43393,
+    "markets": 230739,
+    "markets_without_settlement_time": 0,
+    "markets_settled_after_latest_expiration": 1487
+  },
+  "validity": {
+    "hours": 576,
+    "empty_hour_share": 0.005208333333333333,
+    "unmatched_share": 0.0,
+    "unsettled_share": 1.1980448100387338e-07,
+    "periods": [
+      "confirmation",
+      "exploration"
+    ],
+    "valid": true,
+    "reasons": []
+  },
+  "replication_A_pooled": {
+    "all": {
+      "mean_c": 0.2272,
+      "t_by_side": {
+        "short_yes": 0.03,
+        "long_yes": 0.65
+      }
+    },
+    "confirmation": {
+      "mean_c": 0.1521,
+      "t_by_side": {
+        "short_yes": -0.3,
+        "long_yes": 0.73
+      }
+    },
+    "exploration": {
+      "mean_c": 0.6263,
+      "t_by_side": {
+        "long_yes": -0.42,
+        "short_yes": 1.72
+      }
+    }
+  },
+  "replication_fails": false,
+  "gate_written": true,
+  "pairs_tested": 289,
+  "qualifying": [
+    {
+      "variant": "PENNY",
+      "category": "Entertainment",
+      "side": "short_yes",
+      "bucket": 0,
+      "exploration_mean_c": 3.1023,
+      "exploration_t": 6.68,
+      "confirmation_mean_c": 1.7305,
+      "confirmation_t": 3.08
+    },
+    {
+      "variant": "PENNY",
+      "category": "Entertainment",
+      "side": "short_yes",
+      "bucket": 1,
+      "exploration_mean_c": 7.8879,
+      "exploration_t": 3.48,
+      "confirmation_mean_c": 9.9746,
+      "confirmation_t": 5.44
+    },
+    {
+      "variant": "PENNY",
+      "category": "Mentions",
+      "side": "short_yes",
+      "bucket": 1,
+      "exploration_mean_c": 7.1444,
+      "exploration_t": 4.82,
+      "confirmation_mean_c": 6.266,
+      "confirmation_t": 4.38
+    },
+    {
+      "variant": "PENNY",
+      "category": "Mentions",
+      "side": "short_yes",
+      "bucket": 2,
+      "exploration_mean_c": 14.2088,
+      "exploration_t": 7.3,
+      "confirmation_mean_c": 7.8598,
+      "confirmation_t": 5.11
+    },
+    {
+      "variant": "PENNY",
+      "category": "Politics",
+      "side": "short_yes",
+      "bucket": 0,
+      "exploration_mean_c": 2.8181,
+      "exploration_t": 2.97,
+      "confirmation_mean_c": 3.6412,
+      "confirmation_t": 7.8
+    },
+    {
+      "variant": "JOIN",
+      "category": "Climate and Weather",
+      "side": "short_yes",
+      "bucket": 0,
+      "exploration_mean_c": 1.1463,
+      "exploration_t": 2.66,
+      "confirmation_mean_c": 1.4576,
+      "confirmation_t": 2.79
+    },
+    {
+      "variant": "JOIN",
+      "category": "Entertainment",
+      "side": "short_yes",
+      "bucket": 1,
+      "exploration_mean_c": 10.6929,
+      "exploration_t": 4.87,
+      "confirmation_mean_c": 6.4856,
+      "confirmation_t": 2.62
+    }
+  ]
+}
