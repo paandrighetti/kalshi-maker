@@ -18,11 +18,19 @@ published maker premium is largest there.
 
 [PREREGISTRATION.md](PREREGISTRATION.md) fixes the sample, the statistics, the cells, the
 decision rule, the holdout and the forward test before any sample trade was downloaded. It was
-the first commit of this repository, and its two amendments, both made before any download, are
-logged at its end with their reasons: a synthetic run and an independent review of the code
-found weaknesses in the inference and a look-ahead in the selection of markets. Its SHA-256 is
-printed in every report and stored in `data/gate.json`; the constants it names live in
-`src/kmaker/config.py`, not in `.env`.
+the first commit of this repository, and its three amendments, all made before any download,
+are logged at its end with their reasons: a synthetic run and two independent reviews of the
+code found weaknesses in the inference, a look-ahead in the selection of markets and a split
+between periods that depended on the outcome. Its SHA-256 is printed in every report and
+stored in `data/gate.json`; the constants it names live in `src/kmaker/config.py`, not in
+`.env`.
+
+## Decision
+
+The backtest wrote its decision on 24 September 2026 under the unchanged pre-registration:
+[reports/BACKTEST.md](reports/BACKTEST.md), generated from `reports/backtest/primary/`. The
+holdout is added to the same file when it completes, and the forward paper test reports in
+`reports/FORWARD.md`.
 
 ## What runs
 
@@ -53,13 +61,16 @@ otherwise, o the outcome and p the YES price:
 - B, a maker one tick inside the best price: the first level of each taker order, at most 10
   contracts, one tick worse for the maker. Decides the PENNY variant.
 - C, the last order in the queue: only the levels a taker order emptied. Decides the JOIN
-  variant. A lower bound, since sweeps are the most informed orders.
+  variant. The pre-registration calls it a lower bound, since sweeps are the most informed
+  orders; it also counts emptied levels deeper than the best price, where a JOIN quote would
+  not rest.
 
-Markets are selected on `latest_expiration_time` (on or before 15 September 2026), which is
-fixed at listing, rather than on having settled by the download date, which would keep the
-markets that resolved early. A pair (variant, category, side, bucket) qualifies when it is
-positive with t >= 2 in the exploration period (markets settled before 1 May 2026) and in the
-confirmation period (after), each with
+Markets are selected on `latest_expiration_time` (on or before 15 September 2026), assumed
+fixed at listing (the paper maker logs any change), rather than on having settled by the
+download date, which would keep the markets that resolved early. A pair (variant, category,
+side, bucket) qualifies when it is positive with t >= 2 in the exploration period (markets
+whose `latest_expiration_time` is before 1 May 2026) and in the confirmation period (the
+others), each with
 at least 30 clusters, 100 events, 500 contracts and 10 losing clusters. A cluster is a category
 and a settlement date, so markets that share a shock on one day count once. The paper maker
 quotes only qualifying pairs.
@@ -78,8 +89,8 @@ well under Kalshi's basic limit of about 20 per second together. The backtest's 
 file needs about 1 GB plus 130 bytes per downloaded trade of free disk; the download stops
 below 3 GB.
 Transient API failures are retried for about an hour inside the pipeline; if the data checks
-fail, the missing parts are downloaded again every day for up to 6 days before the gate is
-written as invalid. A failed pipeline sends a Telegram message and tries again 30 minutes later
+fail, the missing parts are downloaded again every day, and the gate is written as invalid at
+the seventh daily attempt, six days after the first. A failed pipeline sends a Telegram message and tries again 30 minutes later
 (a day later after four failures in a day); it never exits, so after a reboot Docker restarts it
 and it resumes. Its DuckDB phase waits out 05:30 to 07:30 UTC, when updown-desk's reporter uses
 most of the host's memory. The reporter sends a daily digest: download progress while there is
