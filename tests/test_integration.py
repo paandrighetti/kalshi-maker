@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import time
 from datetime import datetime, timezone
 
@@ -443,6 +444,20 @@ def test_pending_digest_reports_progress(pipeline_env):
     (data_dir / "hours_r0.json").write_text(json.dumps({"2026-01-01T00": 5}))
     text = cli._pending_digest(Settings())
     assert "no gate yet; 1 of" in text and "last progress" in text
+
+
+def test_pending_digest_counts_the_market_download_as_progress(pipeline_env):
+    # once every sampled hour is in, only markets/ and ranges/ change for many hours
+    api, data_dir, reports_dir = pipeline_env
+    data_dir.mkdir(parents=True)
+    hours = data_dir / "hours_r0.json"
+    hours.write_text(json.dumps({"2026-01-01T00": 5}))
+    old = time.time() - 10 * 3600
+    os.utime(hours, (old, old))
+    (data_dir / "markets").mkdir()
+    (data_dir / "markets" / "part-00000.parquet").write_bytes(b"")
+    text = cli._pending_digest(Settings())
+    assert "last progress 0.0 h ago" in text
 
 
 def test_the_telegram_token_stays_out_of_the_logs(pipeline_env, monkeypatch, caplog):

@@ -186,9 +186,15 @@ def _pending_digest(s: Settings) -> str:
     )
     done = ingest.hour_counts(s.data_dir, PREREG.primary_residue)
     path = s.data_dir / f"hours_r{PREREG.primary_residue}.json"
+    # after the last sampled hour, the download goes on in markets/ and ranges/
+    marks = [
+        p.stat().st_mtime
+        for p in (path, s.data_dir / "markets", s.data_dir / "ranges")
+        if p.exists()
+    ]
     progress = (
-        f"last progress {(time.time() - path.stat().st_mtime) / 3600:.1f} h ago"
-        if path.exists()
+        f"last progress {(time.time() - max(marks)) / 3600:.1f} h ago"
+        if marks
         else "download not started"
     )
     lines = [
