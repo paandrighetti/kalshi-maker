@@ -25,7 +25,9 @@ between periods that depended on the outcome. The fourth, on 25 September 2026, 
 forward test to two looks with a corrected threshold and an end date, before either variant
 reached the minimum sample. Its SHA-256 is printed in every report and
 stored in `data/gate.json`; the constants it names live in `src/kmaker/config.py`, not in
-`.env`.
+`.env`. The commit ids changed on 25 September 2026, when the author of every commit
+was set to the repository owner; contents and dates did not
+([history-rewrite.md](history-rewrite.md)).
 
 ## Decision
 
