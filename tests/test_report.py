@@ -138,6 +138,71 @@ def test_forward_report_end_to_end(tmp_path):
     # 36 fills keep 0.20, 4 lose 0.80 on 10 contracts: (72 - 32) / 400 = 10 cents per contract
     assert "10.000 cents per contract" in text
     assert "PENNY: 40 ev" in digest
+    # the fills date from 1970, so this report is past day 60: the final look is recorded,
+    # with 40 events against the 200 required
+    saved = json.loads((d / report.STATUS_FILE).read_text())
+    assert saved["PENNY"]["final"]["status"] == "inconclusive"
+    assert "INCONCLUSIVE at look 2" in digest
+    assert report.forward_report(d)[1].splitlines()[-1] == digest.splitlines()[-1]
+
+
+DAY = 86_400 * S
+
+
+def settled_frame(pnls):
+    """One settled event per cluster, 10 contracts each, with the given profit in USD."""
+    n = len(pnls)
+    return pd.DataFrame(
+        {
+            "pnl": pnls,
+            "qty": 10.0,
+            "cluster": [f"c{i}" for i in range(n)],
+            "event": [f"E{i}" for i in range(n)],
+        }
+    )
+
+
+BORDERLINE = settled_frame([1.0] * 190 + [-11.0] * 10)  # 4 cents per contract, t = 2.16
+STRONG = settled_frame([1.0] * 190 + [-10.0] * 10)  # 4.5 cents per contract, t = 2.65
+
+
+def test_look_1_needs_the_corrected_threshold_then_waits_for_day_60():
+    # t = 2.16 passed the first rule (t >= 2) but not a look under Amendment 4 (t >= 2.28)
+    text, rec = report.forward_status(BORDERLINE, 0, 20 * DAY)
+    assert rec["final"] is None and [lk["look"] for lk in rec["looks"]] == [1]
+    assert "look 1 on" in text and "not met" in text
+    # a stronger result before day 60 is not a new look
+    text, again = report.forward_status(STRONG, 0, 40 * DAY, rec)
+    assert again == rec and text.startswith("running, day 40 of 60")
+    # the final look
+    text, final = report.forward_status(STRONG, 0, 60 * DAY, again)
+    assert final["final"]["status"] == "success" and final["final"]["look"] == 2
+    assert text.startswith("SUCCESS at look 2")
+
+
+def test_success_at_look_1_is_final():
+    text, rec = report.forward_status(STRONG, 0, 12 * DAY)
+    assert rec["final"]["status"] == "success" and rec["final"]["look"] == 1
+    later = report.forward_status(settled_frame([-1.0] * 200), 0, 45 * DAY, rec)
+    assert later == (text, rec)
+
+
+def test_day_60_is_a_single_look_when_the_minimums_come_late():
+    few = settled_frame([1.0] * 50)
+    text, rec = report.forward_status(few, 0, 30 * DAY)
+    assert rec == {"looks": [], "final": None} and "(now 50 and 0)" in text
+    text, rec = report.forward_status(few, 0, 61 * DAY, rec)
+    assert rec["final"]["status"] == "inconclusive" and text.startswith("INCONCLUSIVE at look 2")
+    _, late = report.forward_status(STRONG, 0, 61 * DAY)
+    assert [lk["look"] for lk in late["looks"]] == [2] and late["final"]["status"] == "success"
+
+
+def test_a_negative_mean_after_day_30_abandons_for_good():
+    negative = settled_frame([1.0] * 20 + [-5.0] * 10)
+    assert report.forward_status(negative, 0, 29 * DAY)[1]["final"] is None
+    text, rec = report.forward_status(negative, 0, 31 * DAY)
+    assert rec["final"]["status"] == "abandoned" and text.startswith("ABANDONED")
+    assert report.forward_status(STRONG, 0, 60 * DAY, rec)[1] == rec
 
 
 def test_void_results_release_risk_and_carry_no_pnl():

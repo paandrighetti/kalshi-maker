@@ -49,6 +49,11 @@ class Prereg:
     max_risk_per_event: float = 500.0
     max_risk_total: float = 5000.0
     success_min_events: int = 200
+    # forward success is checked twice (Amendment 4): the one-sided error of t >= 2 (2.3 %) is
+    # split between the two looks (Bonferroni), 1.14 % each, hence t >= 2.28
+    forward_look_t: float = 2.28
+    forward_final_day: float = 60.0
+    forward_abandon_day: float = 30.0
 
 
 PREREG = Prereg()

@@ -18,10 +18,12 @@ published maker premium is largest there.
 
 [PREREGISTRATION.md](PREREGISTRATION.md) fixes the sample, the statistics, the cells, the
 decision rule, the holdout and the forward test before any sample trade was downloaded. It was
-the first commit of this repository, and its three amendments, all made before any download,
-are logged at its end with their reasons: a synthetic run and two independent reviews of the
+the first commit of this repository, and its amendments are logged at its end with their
+reasons. Three were made before any download: a synthetic run and two independent reviews of the
 code found weaknesses in the inference, a look-ahead in the selection of markets and a split
-between periods that depended on the outcome. Its SHA-256 is printed in every report and
+between periods that depended on the outcome. The fourth, on 25 September 2026, limits the
+forward test to two looks with a corrected threshold and an end date, before either variant
+reached the minimum sample. Its SHA-256 is printed in every report and
 stored in `data/gate.json`; the constants it names live in `src/kmaker/config.py`, not in
 `.env`.
 
@@ -51,7 +53,8 @@ paper (continuous)
   best price with the displayed size ahead); fills and settlements go to data/paper.sqlite
 reporter (daily, 07:00 UTC)
   reports/FORWARD.md and a Telegram digest: settled profit per contract by cell, under the
-  pre-registered position limits, with clustered t
+  pre-registered position limits, with clustered t, and the two looks of Amendment 4 recorded
+  once in data/forward_status.json
 ```
 
 The statistics, in cents per contract, with d = -1 when the taker gained YES exposure and +1

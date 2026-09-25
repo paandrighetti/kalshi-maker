@@ -135,9 +135,12 @@ is used.
 - Settlement is recorded only once the market is `finalized` or `settled`.
 - Positions are held to settlement. Strategy view: fills in qualifying pairs, at most 100
   contracts per market and variant, 500 USD at risk per event, 5,000 USD in total.
-- Success: pooled strategy-view profit per contract > 0 with t >= 2 (clusters as in the
-  backtest) once 200 events have settled and at least 10 clusters are negative. A variant is
-  abandoned if its mean is negative after 30 days.
+- Success (Amendment 4): pooled strategy-view profit per contract > 0 with t >= 2.28 (clusters
+  as in the backtest), checked at two looks per variant: the first report in which 200 events
+  have settled and at least 10 clusters are negative, if it comes before day 60, and the first
+  report on or after day 60, counting days from the variant's first fill. A variant that has
+  not succeeded at the day-60 look is inconclusive. A variant is abandoned if its mean is
+  negative in a report on or after day 30. A status, once reached, is final.
 
 ## Amendments
 
@@ -200,8 +203,36 @@ independent review:
   written, since the causes it detects (markets not yet final, an API fault that emptied an
   hour) are often temporary.
 
+Amendment 4, 25 September 2026, after the forward test started on 24 September and before
+either variant reached the minimum sample, after a review of the forward rule. It changes the
+forward test only. The backtest gate was written on 24 September under the previous version of
+this file (SHA-256 02e4f9180ac2b8b08b46401119b2e9bce9614561dbfd912b78dc922045da8f45), which
+`gate.json` keeps and the forward report prints next to the current one.
+
+- The first success rule was checked in every daily report once the minimums were reached, with
+  no end date, so each report was one more chance for a variant without edge to cross t >= 2.
+  On simulated daily results with zero edge (200,000 paths, `scripts/sequential_looks.py`), a
+  single check on day 60 gives 2.2 % false successes, a check every day from day 20 to day 60
+  gives 8.2 %, and from day 20 to day 180 13.0 %; with no end date the probability tends to one
+  (Armitage, McPherson and Rowe, 1969). The two looks below give 2.0 % in the same simulation.
+- Success is now checked at two looks only (the Success line above). Each look gets half of the
+  one-sided error of t >= 2 (2.3 %), hence t >= 2.28, so the total cannot exceed 2.3 % whatever
+  the dates of the looks (Bonferroni). Pocock's constant for two equally spaced looks is lower
+  (2.18; Pocock, 1977), but the date of the first look here depends on the data. When the
+  minimums are first reached on or after day 60, the day-60 look is the only one.
+- The first rule had no end: a variant that stayed positive without reaching t >= 2 ran
+  forever. It is now inconclusive after the day-60 look.
+- Each look and each final status is written once to `data/forward_status.json` and never
+  changed, and the digest shows them. The paper maker keeps quoting after a final status; its
+  later fills are described, not tested.
+- No look had taken place when this amendment was written: the report of 25 September, 07:00
+  UTC, showed JOIN with 19 settled events and no computable t, and PENNY with 1 settled event.
+  The new rule is stricter than the one it replaces and depends on no forward result.
+
 ## References
 
+- Armitage, P., McPherson, C. K. and Rowe, B. C. (1969). Repeated Significance Tests on
+  Accumulating Data. Journal of the Royal Statistical Society, Series A, 132(2), 235-244.
 - Bartlett, R. and O'Hara, M. (2026). Adverse Selection in Prediction Markets: Evidence from
   Kalshi. SSRN 6615739.
 - Becker, J. (2026). The Microstructure of Wealth Transfer in Prediction Markets. SSRN 7217640.
@@ -209,3 +240,5 @@ independent review:
   Prediction Market. CEPR Discussion Paper 20631; SSRN 5502658.
 - Kalshi. Fee Schedule (maker fee series list) and API documentation (order direction, historical
   data).
+- Pocock, S. J. (1977). Group Sequential Methods in the Design and Analysis of Clinical Trials.
+  Biometrika, 64(2), 191-199.

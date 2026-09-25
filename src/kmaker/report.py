@@ -252,22 +252,87 @@ def strategy_view(f: pd.DataFrame, qualifying: list[dict]) -> pd.DataFrame:
     return pd.DataFrame(keep_rows)
 
 
-def forward_status(settled: pd.DataFrame, first_fill_us: int, now_us: int) -> str:
+STATUS_FILE = "forward_status.json"
+
+
+def _finite(x: float) -> float | None:
+    return float(x) if np.isfinite(x) else None
+
+
+def _variant_stats(settled: pd.DataFrame) -> dict:
     if settled.empty:
-        return "running, nothing settled"
+        return {"events": 0, "losing": 0, "mean_c": None, "t": None}
     rows = settled.assign(s=settled["pnl"], w=settled["qty"], n=1, k=0)
-    t = cluster_table(rows, ["k"]).iloc[0]
+    r = cluster_table(rows, ["k"]).iloc[0]
+    return {
+        "events": int(r["events"]),
+        "losing": int(r["losing"]),
+        "mean_c": _finite(r["mean_c"]),
+        "t": _finite(r["t"]),
+    }
+
+
+def _status_text(rec: dict, st: dict, days: float) -> str:
+    f = rec["final"]
+    if f and f["status"] == "abandoned":
+        return f"ABANDONED on {f['date']}: mean {_fmt(f['mean_c'])} c/ct on day {f['day']:.0f}"
+    if f:
+        word = "SUCCESS" if f["status"] == "success" else "INCONCLUSIVE"
+        return (
+            f"{word} at look {f['look']} on {f['date']}: {f['events']} events, "
+            f"{f['losing']} losing clusters, t {_fmt(f['t'])} (threshold {PREREG.forward_look_t})"
+        )
+    head = f"running, day {days:.0f} of {PREREG.forward_final_day:.0f}"
+    if rec["looks"]:
+        lk = rec["looks"][0]
+        return (
+            f"{head}; look 1 on {lk['date']} not met (mean {_fmt(lk['mean_c'])} c/ct, "
+            f"t {_fmt(lk['t'])}), final look on day {PREREG.forward_final_day:.0f}"
+        )
+    return (
+        f"{head}; look 1 at {PREREG.success_min_events} events and "
+        f"{PREREG.min_losing_clusters} losing clusters (now {st['events']} and {st['losing']})"
+    )
+
+
+def forward_status(
+    settled: pd.DataFrame, first_fill_us: int, now_us: int, record: dict | None = None
+) -> tuple[str, dict]:
+    """Status of one variant under Amendment 4, and its record of looks and final status.
+
+    Success is checked at two looks only: the first report where the minimums hold (200 settled
+    events and 10 negative clusters) before day 60, and the first report on or after day 60.
+    Each look needs a positive mean and t >= 2.28. A mean below zero in a report on or after
+    day 30 abandons the variant. A final status is kept once reached: `record` is what
+    `data/forward_status.json` holds for the variant, and a final one is returned unchanged.
+    """
+    rec = {"looks": list((record or {}).get("looks", [])), "final": (record or {}).get("final")}
     days = (now_us - first_fill_us) / 86_400e6
-    if (
-        t["events"] >= PREREG.success_min_events
-        and t["losing"] >= PREREG.min_losing_clusters
-        and t["mean_c"] > 0
-        and t["t"] >= PREREG.min_t
-    ):
-        return "success criterion met"
-    if days >= 30 and t["mean_c"] < 0:
-        return "abandon criterion met"
-    return f"running, day {days:.0f} of the forward test"
+    if rec["final"]:
+        return _status_text(rec, {}, days), rec
+    st = _variant_stats(settled)
+    minimums = (
+        st["events"] >= PREREG.success_min_events and st["losing"] >= PREREG.min_losing_clusters
+    )
+    met = bool(
+        minimums
+        and st["mean_c"] is not None
+        and st["mean_c"] > 0
+        and st["t"] is not None
+        and st["t"] >= PREREG.forward_look_t
+    )
+    date = datetime.fromtimestamp(now_us / 1e6, timezone.utc).strftime("%Y-%m-%d")
+    entry = {"date": date, "day": round(days, 1), **st, "met": met}
+    if days >= PREREG.forward_abandon_day and st["mean_c"] is not None and st["mean_c"] < 0:
+        rec["final"] = {"status": "abandoned", **entry}
+    elif days >= PREREG.forward_final_day:
+        rec["looks"].append({"look": 2, **entry})
+        rec["final"] = {"status": "success" if met else "inconclusive", "look": 2, **entry}
+    elif minimums and not rec["looks"]:
+        rec["looks"].append({"look": 1, **entry})
+        if met:
+            rec["final"] = {"status": "success", "look": 1, **entry}
+    return _status_text(rec, st, days), rec
 
 
 def _health(cycles: pd.DataFrame, traded_gate: dict | None) -> str:
@@ -303,8 +368,8 @@ def forward_report(data_dir: Path) -> tuple[str, str]:
         "# Forward paper maker",
         "",
         f"Generated {now.isoformat(timespec='seconds')}. Pre-registration SHA-256 "
-        f"`{prereg_sha256()}`; gate of {gate['generated_at']} with "
-        f"{len(gate['qualifying'])} qualifying pairs.",
+        f"`{prereg_sha256()}`; gate of {gate['generated_at']}, written under "
+        f"`{gate.get('prereg_sha256', 'n/a')}`, with {len(gate['qualifying'])} qualifying pairs.",
         "",
     ]
     idle = _idle_reason(gate)
@@ -330,12 +395,21 @@ def forward_report(data_dir: Path) -> tuple[str, str]:
     now_us = int(now.timestamp() * 1e6)
     out = list(head)
     digest = ["kalshi-maker forward", health]
+    status_path = data_dir / STATUS_FILE
+    records = json.loads(status_path.read_text()) if status_path.exists() else {}
+    changed = False
     for variant in sorted(f["variant"].unique()):
         fv = f[f["variant"] == variant]
         sv = strategy_view(fv, gate["qualifying"])
         settled = sv[sv["settled"]] if not sv.empty else sv
-        status = forward_status(settled, int(fv["ts_us"].min()), now_us)
+        old = records.get(variant, {"looks": [], "final": None})
+        status, rec = forward_status(settled, int(fv["ts_us"].min()), now_us, old)
+        if rec != old:
+            records[variant], changed = rec, True
         out += [f"## {variant}", "", f"Status: {status}.", ""]
+        if rec["looks"]:
+            looks = pd.DataFrame(rec["looks"]).astype({"mean_c": float, "t": float})
+            out += [md_table(looks, {"mean_c": 3, "t": 2}), ""]
         if not settled.empty:
             rows = settled.assign(s=settled["pnl"], w=settled["qty"], n=1)
             by = cluster_table(rows.assign(k="all"), ["k"])
@@ -358,7 +432,7 @@ def forward_report(data_dir: Path) -> tuple[str, str]:
                 f"PnL {pnl:.2f} USD, {status}"
             )
         else:
-            digest.append(f"{variant}: nothing settled yet")
+            digest.append(f"{variant}: nothing settled yet; {status}")
         open_ = sv[~sv["closed"]] if not sv.empty else sv
         if not open_.empty:
             out += [
@@ -390,4 +464,8 @@ def forward_report(data_dir: Path) -> tuple[str, str]:
             f"{cycles['trade_lag_s'].median():.1f} s; {errs} cycles with a failed stage.",
             "",
         ]
+    if changed:  # a look or a final status is added once and never changed afterwards
+        tmp = status_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(records, indent=2))
+        tmp.replace(status_path)
     return "\n".join(out) + "\n", "\n".join(digest)
