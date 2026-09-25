@@ -175,3 +175,34 @@ def test_empty_hours_are_fetched_once_more_and_keep_their_schema(tmp_path, monke
         f"SELECT count(*), any_value(ticker) FROM read_parquet('{d}/trades_r0/*.parquet')"
     ).fetchone()
     assert got == (2, "KXM-1-A")
+
+
+def _market_part(d, part, records):
+    rows = [
+        {
+            **{c: None for c in ingest.MARKET_SCHEMA.names},
+            "ticker": t,
+            "status": status,
+            "result": result,
+        }
+        for t, status, result in records
+    ]
+    ingest.write_rows(rows, ingest.MARKET_SCHEMA, d / "markets" / f"part-{part:05d}.parquet")
+
+
+def test_markets_to_fetch_follow_the_latest_part(tmp_path):
+    # A final; B final in the later part; C final first, then re-fetched and not final; D new
+    _market_part(
+        tmp_path, 0, [("A", "finalized", "yes"), ("B", "active", ""), ("C", "settled", "no")]
+    )
+    _market_part(tmp_path, 1, [("B", "finalized", "no"), ("C", "determined", "no")])
+    trades = []
+    for i, t in enumerate(["A", "B", "C", "D", "D"]):
+        path = tmp_path / "trades_r0" / f"h{i}.parquet"
+        ingest.write_rows([(t, f"id{i}", 1.0, 0.5, True, 0, False)], ingest.TRADE_SCHEMA, path)
+        trades.append(path)
+    n_wanted, n_final, todo = ingest._todo_tickers(
+        tmp_path, trades + [tmp_path / "missing.parquet"]
+    )
+    assert (n_wanted, n_final) == (4, 2)
+    assert pd.read_parquet(todo)["ticker"].tolist() == ["C", "D"]

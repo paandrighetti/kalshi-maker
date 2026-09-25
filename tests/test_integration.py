@@ -482,7 +482,8 @@ def test_the_telegram_token_stays_out_of_the_logs(pipeline_env, monkeypatch, cap
     assert "SECRET" not in caplog.text
 
 
-def test_pipeline_forever_retries_failures_then_idles(monkeypatch):
+def test_pipeline_forever_retries_failures_then_idles(monkeypatch, tmp_path):
+    monkeypatch.setenv("KM_DATA_DIR", str(tmp_path))
     runs, sleeps, sent = [], [], []
 
     def flaky(s, holdout):
@@ -505,3 +506,15 @@ def test_pipeline_forever_retries_failures_then_idles(monkeypatch):
         cli.pipeline_forever(Settings(), holdout=False)
     assert len(runs) == 3 and sleeps[:2] == [1800, 1800]
     assert len(sent) == 2 and "failed (RuntimeError: boom)" in sent[0]
+
+
+def test_repeated_starts_alert_once_and_slow_down(monkeypatch, tmp_path):
+    # the holdout was killed for memory every 18 s for 15 hours, silently
+    monkeypatch.setenv("KM_DATA_DIR", str(tmp_path))
+    sent = []
+    monkeypatch.setattr(cli.telegram, "send", lambda t, c, text: sent.append(text))
+    s, t0 = Settings(), 1_790_000_000.0
+    waits = [cli._restart_wait(s, t0 + 18 * i) for i in range(5)]
+    assert waits == [0.0, 0.0, 3600.0, 7200.0, 14400.0]
+    assert len(sent) == 1 and "started 3 times in 24 h" in sent[0]
+    assert cli._restart_wait(s, t0 + 2 * 86400) == 0.0  # older starts leave the window

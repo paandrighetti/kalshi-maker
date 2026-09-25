@@ -22,6 +22,7 @@ from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 
+import duckdb
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -29,8 +30,8 @@ import pyarrow.parquet as pq
 from .client import Kalshi
 from .config import PREREG
 from .schema import (
+    FINAL_STATUSES,
     MARKET_COLUMNS,
-    is_final,
     normalize_market,
     normalize_trade,
     parse_ranges,
@@ -249,24 +250,61 @@ def ingest_trades(
 # markets -----------------------------------------------------------------------------------
 
 
-def _final_tickers(data_dir: Path) -> set[str]:
-    final: set[str] = set()
-    for p in sorted((data_dir / "markets").glob("*.parquet")):
-        t = pq.read_table(p, columns=["ticker", "status", "result"]).to_pydict()
-        for ticker, status, result in zip(t["ticker"], t["status"], t["result"], strict=True):
-            if is_final(status, result):
-                final.add(ticker)
-            else:
-                final.discard(ticker)  # a later part re-fetched it before it was final
-    return final
+def _todo_tickers(data_dir: Path, trade_paths: Iterable[Path]) -> tuple[int, int, Path]:
+    """Tickers of the trade files whose latest market record is not final, sorted into a
+    parquet file, with the number of tickers in the trades and of final tickers on disk.
 
-
-def _tickers_in(paths: Iterable[Path]) -> set[str]:
-    tickers: set[str] = set()
-    for p in paths:
-        if p.exists():
-            tickers.update(pq.read_table(p, columns=["ticker"]).column("ticker").to_pylist())
-    return tickers
+    A later part supersedes an earlier one, as in the backtest. The sets live in a DuckDB file
+    under a memory cap, so they spill to disk: Python sets of the tickers of the second sample
+    (the holdout, with the first sample's markets on disk) exceeded the container's 1,400 MB,
+    and on synthetic data with 6.5 million tickers in trades and 5 million final they peak at
+    1.7 GB against 0.74 GB here.
+    """
+    files = [str(p) for p in trade_paths if p.exists()]
+    out = data_dir / "markets_todo.parquet"
+    db = data_dir / "markets_todo.duckdb"
+    tmp = data_dir / "duckdb_tmp"
+    tmp.mkdir(parents=True, exist_ok=True)
+    finals = ", ".join(f"'{s}'" for s in FINAL_STATUSES)
+    for p in (db, db.with_suffix(".duckdb.wal")):
+        p.unlink(missing_ok=True)
+    con = duckdb.connect(str(db))
+    try:
+        con.execute("SET memory_limit='500MB'")
+        con.execute("SET threads=1")
+        con.execute(f"SET temp_directory='{tmp}'")
+        con.execute("SET preserve_insertion_order=false")
+        listed = ", ".join(f"'{f}'" for f in files)
+        src = f"read_parquet([{listed}])" if files else "(SELECT NULL::VARCHAR AS ticker LIMIT 0)"
+        con.execute(f"CREATE TABLE w AS SELECT DISTINCT ticker FROM {src}")
+        con.execute("CREATE TABLE f (ticker VARCHAR)")
+        if list((data_dir / "markets").glob("*.parquet")):
+            rec = (
+                "SELECT ticker, status, result, "
+                "regexp_extract(filename, '(part-[0-9]+)[.]parquet$', 1) AS part "
+                f"FROM read_parquet('{data_dir}/markets/*.parquet', filename = true)"
+            )
+            con.execute(
+                f"""
+                INSERT INTO f
+                SELECT r.ticker FROM ({rec}) r
+                JOIN (SELECT ticker, max(part) AS part FROM ({rec}) GROUP BY 1) lp
+                  USING (ticker, part)
+                WHERE r.status IN ({finals})  -- schema.is_final
+                  AND lower(coalesce(r.result, '')) IN ('yes', 'no', 'scalar')
+                """
+            )
+        n_wanted = con.execute("SELECT count(*) FROM w").fetchone()[0]
+        n_final = con.execute("SELECT count(*) FROM f").fetchone()[0]
+        con.execute(
+            "COPY (SELECT ticker FROM w ANTI JOIN f USING (ticker) WHERE ticker IS NOT NULL "
+            f"ORDER BY 1) TO '{out}' (FORMAT parquet)"
+        )
+    finally:
+        con.close()
+        for p in (db, db.with_suffix(".duckdb.wal")):
+            p.unlink(missing_ok=True)
+    return int(n_wanted), int(n_final), out
 
 
 def ingest_markets(client: Kalshi, data_dir: Path, trade_paths: Iterable[Path]) -> dict:
@@ -275,12 +313,10 @@ def ingest_markets(client: Kalshi, data_dir: Path, trade_paths: Iterable[Path]) 
     A later part supersedes an earlier one for the same ticker. Price grids other than the plain
     one-cent grid are written to `ranges/` under the same part number.
     """
-    wanted = _tickers_in(trade_paths)
-    final = _final_tickers(data_dir)
-    todo = sorted(wanted - final)
-    log.info(
-        "markets: %d tickers in trades, %d final, %d to fetch", len(wanted), len(final), len(todo)
-    )
+    n_wanted, n_final, todo_path = _todo_tickers(data_dir, trade_paths)
+    todo = pq.ParquetFile(todo_path)
+    n_todo = todo.metadata.num_rows
+    log.info("markets: %d tickers in trades, %d final, %d to fetch", n_wanted, n_final, n_todo)
     out_dir = data_dir / "markets"
     part = len(list(out_dir.glob("*.parquet"))) if out_dir.exists() else 0
     rows: list[dict] = []
@@ -300,8 +336,9 @@ def ingest_markets(client: Kalshi, data_dir: Path, trade_paths: Iterable[Path]) 
         write_rows(rows, MARKET_SCHEMA, out_dir / f"part-{part:05d}.parquet")
         rows, part = [], part + 1
 
-    for i in range(0, len(todo), MARKET_BATCH):
-        batch = todo[i : i + MARKET_BATCH]
+    done = 0
+    for rb in todo.iter_batches(batch_size=MARKET_BATCH, columns=["ticker"]):
+        batch = rb.column(0).to_pylist()
         got = {m["ticker"]: m for m in client.markets_by_tickers(batch, historical=False)}
         missing = [t for t in batch if t not in got]
         if missing:
@@ -309,16 +346,13 @@ def ingest_markets(client: Kalshi, data_dir: Path, trade_paths: Iterable[Path]) 
             got.update({m["ticker"]: m for m in hist})
         not_found += sum(1 for t in batch if t not in got)
         rows.extend(normalize_market(m) for m in got.values())
+        done += len(batch)
         if len(rows) >= MARKET_PART_ROWS:
             flush()
-            log.info(
-                "markets: %d of %d fetched, %d requests so far",
-                i + len(batch),
-                len(todo),
-                client.requests,
-            )
+            log.info("markets: %d of %d fetched, %d requests so far", done, n_todo, client.requests)
     flush()
-    return {"tickers": len(wanted), "fetched": len(todo), "not_found": not_found}
+    todo_path.unlink(missing_ok=True)
+    return {"tickers": n_wanted, "fetched": n_todo, "not_found": not_found}
 
 
 def write_manifest(data_dir: Path, residue: int, extra: dict) -> None:

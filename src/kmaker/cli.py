@@ -150,13 +150,47 @@ def cmd_pipeline(s: Settings, holdout: bool, retry_wait_s: float = 86400.0) -> N
             )
 
 
+def _restart_wait(s: Settings, now: float | None = None) -> float:
+    """Seconds to wait before running, from the starts of the last 24 hours.
+
+    A pipeline killed from outside (out of memory) cannot report it, and Docker restarts it at
+    once: the holdout ran into that loop every 18 s for 15 hours without a message. From the
+    third start within 24 hours, one Telegram message is sent and each run waits 1 h, 2 h,
+    4 h... up to 24 h.
+    """
+    now = time.time() if now is None else now
+    path = s.data_dir / "pipeline_starts.json"
+    starts = json.loads(path.read_text()) if path.exists() else []
+    starts = [t for t in starts if t > now - 86400] + [now]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(starts))
+    tmp.replace(path)
+    if len(starts) < 3:
+        return 0.0
+    if len(starts) == 3:
+        telegram.send(
+            s.telegram_token,
+            s.telegram_chat,
+            "kalshi-maker: the backtest pipeline started 3 times in 24 h, so it is being stopped "
+            "from outside (out of memory, or restarts by hand); it now waits 1 h, then longer, "
+            "before each run. Logs: docker logs --tail 50 kalshi-maker-backtest-1",
+        )
+    return float(min(86400, 3600 * 2 ** (len(starts) - 3)))
+
+
 def pipeline_forever(s: Settings, holdout: bool) -> None:
     """Run the pipeline to completion, then idle; never exit.
 
     The container restarts only after a reboot or a Docker restart, and then resumes. A
     failure is reported on Telegram and retried after 30 minutes; after four failures in a day
-    the pipeline waits a day before trying again, with a message each time.
+    the pipeline waits a day before trying again, with a message each time. Repeated starts
+    slow down (`_restart_wait`).
     """
+    wait = _restart_wait(s)
+    if wait:
+        log.warning("repeated starts in 24 h: waiting %.0f s before running", wait)
+        time.sleep(wait)
     failures: list[float] = []
     while True:
         try:
