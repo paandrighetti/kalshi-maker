@@ -991,3 +991,15 @@ Sampled hours: 576; empty 0.52% (limit 2%); trades without a market record 0.00%
 | C | exploration | World | long_yes | [0.00, 0.10) | 1 | 2 | 1 | 26 | 2 | -2.231 | n/a | n/a |
 | C | exploration | World | long_yes | [0.10, 0.30) | 1 | 1 | 1 | 35 | 2 | -15.086 | n/a | n/a |
 | C | exploration | World | short_yes | [0.00, 0.10) | 1 | 6 | 0 | 3383 | 29 | 6.170 | n/a | n/a |
+
+## Holdout hours (reported, not used to decide)
+
+| variant | category | side | bucket | exploration_mean_c | exploration_t | confirmation_mean_c | confirmation_t | holdout_events | holdout_mean_c | holdout_t | contradicted |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| PENNY | Entertainment | short_yes | [0.00, 0.10) | 3.1023 | 6.68 | 1.7305 | 3.08 | 1327 | 2.891 | 6.42 | False |
+| PENNY | Entertainment | short_yes | [0.10, 0.30) | 7.8879 | 3.48 | 9.9746 | 5.44 | 1080 | 8.141 | 5.34 | False |
+| PENNY | Mentions | short_yes | [0.10, 0.30) | 7.1444 | 4.82 | 6.266 | 4.38 | 1935 | 5.841 | 5.80 | False |
+| PENNY | Mentions | short_yes | [0.30, 0.70) | 14.2088 | 7.3 | 7.8598 | 5.11 | 2198 | 10.072 | 6.64 | False |
+| PENNY | Politics | short_yes | [0.00, 0.10) | 2.8181 | 2.97 | 3.6412 | 7.8 | 553 | 2.130 | 1.54 | False |
+| JOIN | Climate and Weather | short_yes | [0.00, 0.10) | 1.1463 | 2.66 | 1.4576 | 2.79 | 4845 | 1.330 | 3.91 | False |
+| JOIN | Entertainment | short_yes | [0.10, 0.30) | 10.6929 | 4.87 | 6.4856 | 2.62 | 765 | 8.879 | 4.11 | False |

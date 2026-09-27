@@ -1,0 +1,59 @@
+{
+  "label": "r1",
+  "residue": 1,
+  "generated_at": "2026-09-26T01:25:21+00:00",
+  "prereg_sha256": "be8decba1c6aff37d635d2f4790fb97d997751f679e2e40e07937bf1090532e5",
+  "counts": {
+    "trades_unknown_series": 3479,
+    "trades_not_final": 16,
+    "trades_block": 1,
+    "trades_ok": 41214818,
+    "trades_multivariate": 10045441,
+    "trades_late_expiration": 1371836,
+    "trades_not_binary": 20037,
+    "trades": 52655628,
+    "levels": 28419533,
+    "orders": 23908836,
+    "events": 44444,
+    "markets": 240866,
+    "markets_without_settlement_time": 0,
+    "markets_settled_after_latest_expiration": 1680
+  },
+  "validity": {
+    "hours": 600,
+    "empty_hour_share": 0.01,
+    "unmatched_share": 0.0,
+    "unsettled_share": 3.880210999083761e-07,
+    "periods": [
+      "confirmation",
+      "exploration"
+    ],
+    "valid": true,
+    "reasons": []
+  },
+  "replication_A_pooled": {
+    "all": {
+      "mean_c": 0.3746,
+      "t_by_side": {
+        "short_yes": -1.27,
+        "long_yes": 2.64
+      }
+    },
+    "confirmation": {
+      "mean_c": 0.2903,
+      "t_by_side": {
+        "short_yes": -1.81,
+        "long_yes": 2.71
+      }
+    },
+    "exploration": {
+      "mean_c": 0.7309,
+      "t_by_side": {
+        "short_yes": 1.98,
+        "long_yes": 0.02
+      }
+    }
+  },
+  "replication_fails": false,
+  "gate_written": false
+}
