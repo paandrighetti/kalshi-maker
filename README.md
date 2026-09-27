@@ -33,8 +33,10 @@ was set to the repository owner; contents and dates did not
 
 The backtest wrote its decision on 24 September 2026 under the unchanged pre-registration:
 [reports/BACKTEST.md](reports/BACKTEST.md), generated from `reports/backtest/primary/`. The
-holdout is added to the same file when it completes, and the forward paper test reports in
-`reports/FORWARD.md`.
+holdout, added to the same file on 26 September 2026, runs the same statistics on another
+twelfth of the hours of the same markets: all seven qualifying pairs stay positive, six with
+t >= 2, and none is contradicted. It tests the sampling of trades, not new outcomes, and
+decides nothing. The forward paper test reports in `reports/FORWARD.md` on the server.
 
 ## What runs
 
