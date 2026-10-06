@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 
-from kmaker.stats import cluster_table, decide, passes
+from kmaker.stats import cluster_table, decide, leave_one_out, passes, wild_cluster_p
 
 
 def test_cluster_table_matches_hand_computation():
@@ -45,6 +45,97 @@ def test_degenerate_variance_has_no_t():
         }
     )
     assert np.isnan(cluster_table(same, ["k"]).iloc[0]["t"])
+
+
+def test_wild_cluster_p_orders_evidence_and_is_reproducible():
+    w = np.full(30, 10.0)
+    strong = np.r_[np.full(27, 1.0), np.full(3, -1.0)]  # 27 of 30 clusters positive
+    mixed = np.r_[np.full(15, 1.0), np.full(15, -1.0)] + np.linspace(0, 0.1, 30)
+    p_strong = wild_cluster_p(strong, w, draws=9_999, seed=1)
+    p_mixed = wild_cluster_p(mixed, w, draws=9_999, seed=1)
+    assert p_strong < 0.001 < 0.1 < p_mixed < 0.9
+    assert wild_cluster_p(strong, w, draws=9_999, seed=1) == p_strong
+    # the p of a draw count B is a multiple of 1 / (B + 1)
+    assert np.isclose(p_mixed * 10_000, round(p_mixed * 10_000))
+
+
+def test_wild_cluster_p_on_the_day_12_join_clusters():
+    # JOIN in the report of 6 October 2026 (cluster sums in USD and contracts, rounded): the value
+    # Amendment 5 quotes; residuals not restricted to the null would give another p
+    s = [
+        7.2485,
+        148.2063,
+        149.8769,
+        174.5114,
+        -63.2282,
+        -51.9986,
+        -50.9017,
+        78.8067,
+        65.368,
+        84.5604,
+        -100.9904,
+        18.2368,
+        -63.4541,
+        -5.9,
+        8.9974,
+        31.3993,
+        23.8656,
+        6.5,
+        11.012,
+        21.688,
+        89.4452,
+    ]
+    w = [
+        490.57,
+        4487.98,
+        4260.57,
+        4052.27,
+        4107.37,
+        4356.15,
+        4526.35,
+        4736.49,
+        4145.22,
+        3910.36,
+        3929.99,
+        3743.9,
+        165.85,
+        20.0,
+        1177.17,
+        284.27,
+        301.21,
+        50.0,
+        84.84,
+        185.32,
+        715.6,
+    ]
+    assert wild_cluster_p(s, w, draws=99_999, seed=20261006) == 0.05485
+
+
+def test_wild_cluster_p_matches_full_enumeration():
+    # six clusters: all 6^6 weight vectors are equally likely, so the exact p is a count
+    import itertools
+
+    from kmaker.stats import WEBB, _ratio_t
+
+    s = np.array([3.0, -1.0, 2.0, 0.5, -0.5, 1.5])
+    w = np.array([10.0, 12.0, 8.0, 9.0, 11.0, 10.0])
+    t0 = float(_ratio_t(s, w))
+    v = np.array(list(itertools.product(WEBB, repeat=6)))
+    exact = float(np.mean(_ratio_t(v * s, w) >= t0))
+    assert abs(wild_cluster_p(s, w, draws=99_999, seed=3) - exact) < 0.005
+
+
+def test_wild_cluster_p_is_none_without_a_t():
+    assert wild_cluster_p([1.0], [1.0], draws=99, seed=1) is None
+    assert wild_cluster_p([1.0, 1.0], [1.0, 1.0], draws=99, seed=1) is None
+    assert wild_cluster_p([0.0, 0.0, 0.0], [1.0, 1.0, 1.0], draws=99, seed=1) is None
+
+
+def test_leave_one_out_by_hand():
+    # cluster sums (2, 4), (-1, 2), (3, 6): without each, 2 / 8, 5 / 10 and 1 / 6 per contract
+    lo, hi = leave_one_out([2.0, -1.0, 3.0], [4.0, 2.0, 6.0])
+    assert np.isclose(lo, 100 / 6) and np.isclose(hi, 50.0)
+    assert leave_one_out([1.0], [1.0]) is None
 
 
 def _cell(stat, sample, mean=1.0, t=3.0, **kw):

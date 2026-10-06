@@ -138,6 +138,9 @@ def test_forward_report_end_to_end(tmp_path):
     # 36 fills keep 0.20, 4 lose 0.80 on 10 contracts: (72 - 32) / 400 = 10 cents per contract
     assert "10.000 cents per contract" in text
     assert "PENNY: 40 ev" in digest
+    # Amendment 5: the bootstrap p and the leave-one-cluster-out range are printed
+    assert "wild cluster bootstrap" in text and "one cluster left out" in text
+    assert "bootstrap p" in digest
     # the fills date from 1970, so this report is past day 60: the final look is recorded,
     # with 40 events against the 200 required
     saved = json.loads((d / report.STATUS_FILE).read_text())
@@ -185,6 +188,36 @@ def test_success_at_look_1_is_final():
     assert rec["final"]["status"] == "success" and rec["final"]["look"] == 1
     later = report.forward_status(settled_frame([-1.0] * 200), 0, 45 * DAY, rec)
     assert later == (text, rec)
+
+
+def test_bootstrap_is_recorded_and_never_decides(monkeypatch):
+    # Amendment 5: the look keeps the bootstrap p and the leave-one-out range
+    _, rec = report.forward_status(STRONG, 0, 12 * DAY)
+    look = rec["looks"][0]
+    assert 0 < look["wcb_p"] < 1 and look["loo_min_c"] <= look["mean_c"] <= look["loo_max_c"]
+    # a bootstrap p above the per-look error flags the success without changing it
+    monkeypatch.setattr(report, "wild_cluster_p", lambda *a, **k: 0.05)
+    text, flagged = report.forward_status(STRONG, 0, 12 * DAY)
+    assert flagged["final"]["status"] == "success" and flagged["final"]["wcb_p"] == 0.05
+    assert "not robust to the few-cluster correction" in text
+    # and one below it adds nothing
+    monkeypatch.setattr(report, "wild_cluster_p", lambda *a, **k: 0.001)
+    text, _ = report.forward_status(STRONG, 0, 12 * DAY)
+    assert "not robust" not in text
+    # look 2, inconclusive and abandoned statuses are the same whatever the bootstrap says
+    for p in (0.0, 1.0):
+        monkeypatch.setattr(report, "wild_cluster_p", lambda *a, p=p, **k: p)
+        _, rec = report.forward_status(BORDERLINE, 0, 20 * DAY)
+        assert rec["final"] is None
+        assert report.forward_status(STRONG, 0, 60 * DAY, rec)[1]["final"]["status"] == "success"
+        few = report.forward_status(settled_frame([1.0] * 50), 0, 61 * DAY)[1]["final"]
+        assert few["status"] == "inconclusive"
+        negative = settled_frame([1.0] * 20 + [-5.0] * 10)
+        assert report.forward_status(negative, 0, 31 * DAY)[1]["final"]["status"] == "abandoned"
+    # a failing diagnostic leaves its figures empty and the report runs
+    monkeypatch.setattr(report, "wild_cluster_p", lambda *a, **k: 1 / 0)
+    _, rec = report.forward_status(STRONG, 0, 12 * DAY)
+    assert rec["final"]["status"] == "success" and rec["final"]["wcb_p"] is None
 
 
 def test_day_60_is_a_single_look_when_the_minimums_come_late():

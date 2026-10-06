@@ -23,7 +23,9 @@ reasons. Three were made before any download: a synthetic run and two independen
 code found weaknesses in the inference, a look-ahead in the selection of markets and a split
 between periods that depended on the outcome. The fourth, on 25 September 2026, limits the
 forward test to two looks with a corrected threshold and an end date, before either variant
-reached the minimum sample. Its SHA-256 is printed in every report and
+reached the minimum sample. The fifth, on 6 October 2026, after twelve days of forward reports had
+been read, adds a wild cluster bootstrap p and a leave-one-cluster-out range next to the forward
+t; it reports them and decides nothing. The file's SHA-256 is printed in every report and
 stored in `data/gate.json`; the constants it names live in `src/kmaker/config.py`, not in
 `.env`. The commit ids changed on 25 September 2026, when the author of every commit
 was set to the repository owner; contents and dates did not
@@ -57,8 +59,9 @@ paper (continuous)
   best price with the displayed size ahead); fills and settlements go to data/paper.sqlite
 reporter (daily, 07:00 UTC)
   reports/FORWARD.md and a Telegram digest: settled profit per contract by cell, under the
-  pre-registered position limits, with clustered t, and the two looks of Amendment 4 recorded
-  once in data/forward_status.json
+  pre-registered position limits, with clustered t, a wild cluster bootstrap p beside it
+  (Amendment 5, reported only), and the two looks of Amendment 4 recorded once in
+  data/forward_status.json
 ```
 
 The statistics, in cents per contract, with d = -1 when the taker gained YES exposure and +1

@@ -19,6 +19,8 @@ import pandas as pd
 from .config import PREREG
 
 VARIANT_STAT = {"PENNY": "B", "JOIN": "C"}
+# Webb's six-point distribution: mean 0, variance 1, usable with few clusters (Webb 2023)
+WEBB = np.array([-np.sqrt(1.5), -1.0, -np.sqrt(0.5), np.sqrt(0.5), 1.0, np.sqrt(1.5)])
 SAMPLES = ("exploration", "confirmation")
 OUT_COLUMNS = ["clusters", "events", "losing", "contracts", "rows", "mean_c", "se_c", "t"]
 
@@ -56,6 +58,51 @@ def cluster_table(
     ev = df.groupby(keys, as_index=False, observed=True).agg(events=(event, "nunique"))
     out = tot.merge(agg, on=keys).merge(ev, on=keys)
     return finish(out)[keys + OUT_COLUMNS]
+
+
+def _ratio_t(s: np.ndarray, w: np.ndarray) -> np.ndarray:
+    """t of `finish` for one set of cluster sums per row of `s` (shape draws x G)."""
+    G, W = s.shape[-1], w.sum()
+    m = s.sum(axis=-1) / W
+    e2 = ((s - m[..., None] * w) ** 2).sum(axis=-1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        # zero residual variance has no t, as in `finish`
+        return np.where(e2 > 0, m / (np.sqrt(G / (G - 1) * e2) / W), np.nan)
+
+
+def wild_cluster_p(s, w, draws: int, seed: int, chunk: int = 5_000) -> float | None:
+    """One-sided p of a positive mean, by the wild cluster bootstrap with the null imposed.
+
+    `s` and `w` are per-cluster sums of weight x value and of weights. Under the null the mean
+    is zero, so a cluster's restricted residual is its sum: each draw multiplies the sums by
+    Webb weights and recomputes the t of `finish` (Cameron, Gelbach and Miller 2008; MacKinnon
+    and Webb 2017). Reported only (Amendment 5); None when the t itself is not defined.
+    """
+    s, w = np.asarray(s, dtype=float), np.asarray(w, dtype=float)
+    if len(s) < 2 or w.sum() <= 0:
+        return None
+    t0 = float(_ratio_t(s, w))
+    if not np.isfinite(t0):
+        return None
+    rng = np.random.default_rng(seed)
+    hits, done = 0, 0
+    while done < draws:
+        n = min(chunk, draws - done)
+        t = _ratio_t(WEBB[rng.integers(0, 6, size=(n, len(s)))] * s, w)
+        hits += int((t >= t0).sum())  # an undefined t (nan) never counts
+        done += n
+    return (hits + 1) / (draws + 1)
+
+
+def leave_one_out(s, w) -> tuple[float, float] | None:
+    """Lowest and highest mean, in cents per contract, with one cluster left out."""
+    s, w = np.asarray(s, dtype=float), np.asarray(w, dtype=float)
+    rest = w.sum() - w
+    keep = rest > 0
+    if len(s) < 2 or not keep.any():
+        return None
+    means = 100 * (s.sum() - s[keep]) / rest[keep]
+    return float(means.min()), float(means.max())
 
 
 def passes(row: pd.Series | None) -> bool:

@@ -54,6 +54,11 @@ class Prereg:
     forward_look_t: float = 2.28
     forward_final_day: float = 60.0
     forward_abandon_day: float = 30.0
+    # reported next to each t, never decisional (Amendment 5): wild cluster bootstrap, and the
+    # one-sided p of t = 2.28, above which a success is called not robust
+    forward_boot_draws: int = 99_999
+    forward_boot_seed: int = 20261006
+    forward_boot_p: float = 0.0113
 
 
 PREREG = Prereg()

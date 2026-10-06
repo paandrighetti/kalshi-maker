@@ -229,6 +229,30 @@ this file (SHA-256 02e4f9180ac2b8b08b46401119b2e9bce9614561dbfd912b78dc922045da8
   UTC, showed JOIN with 19 settled events and no computable t, and PENNY with 1 settled event.
   The new rule is stricter than the one it replaces and depends on no forward result.
 
+Amendment 5, 6 October 2026, on day 12 of the forward test, after its daily reports had been
+read and before either variant reached a look. It adds two figures to the forward report and to
+each look it records. It changes no status, threshold or look date. The forward reports up to
+6 October print the SHA-256 of the version it replaces,
+be8decba1c6aff37d635d2f4790fb97d997751f679e2e40e07937bf1090532e5.
+
+- The forward t uses the cluster-robust standard error with the G/(G - 1) factor. With few
+  clusters that standard error is too small and the t rejects too often (Cameron, Gelbach and
+  Miller, 2008; MacKinnon and Webb, 2017). The forward test has few: in the report of 6 October,
+  07:00 UTC, JOIN had 21 clusters and PENNY 27, and the first looks are expected with 30 to 40.
+  In that report JOIN's t of 1.75 gave a one-sided p of 0.040 under the normal approximation and
+  0.055 under the bootstrap below.
+- Each report and each look also give the one-sided p of a wild cluster bootstrap with the null
+  of a zero mean imposed: the restricted residual of a cluster is its sum, the weights follow
+  Webb's six-point distribution (Webb, 2023), 99,999 draws with seed 20261006, and each draw
+  recomputes the cluster-robust t defined above. They also give the lowest and the highest mean
+  when one cluster is left out.
+- These figures are reported, not decisional, because they were added after the day-12 results
+  were seen, and a rule chosen at that point could be chosen for its effect on the result. The
+  rule of Amendment 4 decides every status. If a look meets it while the bootstrap p is above
+  0.0113, the one-sided normal p of t = 2.28, the report says that the success does not survive
+  the few-cluster correction. A failure of these figures leaves them empty and never stops a
+  report.
+
 ## References
 
 - Armitage, P., McPherson, C. K. and Rowe, B. C. (1969). Repeated Significance Tests on
@@ -238,7 +262,13 @@ this file (SHA-256 02e4f9180ac2b8b08b46401119b2e9bce9614561dbfd912b78dc922045da8
 - Becker, J. (2026). The Microstructure of Wealth Transfer in Prediction Markets. SSRN 7217640.
 - Burgi, C., Deng, W. and Whelan, K. (2025). Makers and Takers: The Economics of the Kalshi
   Prediction Market. CEPR Discussion Paper 20631; SSRN 5502658.
+- Cameron, A. C., Gelbach, J. B. and Miller, D. L. (2008). Bootstrap-Based Improvements for
+  Inference with Clustered Errors. Review of Economics and Statistics, 90(3), 414-427.
 - Kalshi. Fee Schedule (maker fee series list) and API documentation (order direction, historical
   data).
+- MacKinnon, J. G. and Webb, M. D. (2017). Wild Bootstrap Inference for Wildly Different Cluster
+  Sizes. Journal of Applied Econometrics, 32(2), 233-254.
 - Pocock, S. J. (1977). Group Sequential Methods in the Design and Analysis of Clinical Trials.
   Biometrika, 64(2), 191-199.
+- Webb, M. D. (2023). Reworking Wild Bootstrap-Based Inference for Clustered Errors. Canadian
+  Journal of Economics, 56(3), 839-858.

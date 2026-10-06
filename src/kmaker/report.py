@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import heapq
 import json
+import logging
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,9 +19,10 @@ import pandas as pd
 
 from .config import PREREG, prereg_sha256
 from .schema import bucket_label, maker_fee
-from .stats import cluster_table
+from .stats import cluster_table, leave_one_out, wild_cluster_p
 
 SIDE_SIGN = {"short_yes": -1.0, "long_yes": 1.0}
+log = logging.getLogger(__name__)
 
 
 def _fmt(x: float, nd: int = 2) -> str:
@@ -272,16 +274,40 @@ def _variant_stats(settled: pd.DataFrame) -> dict:
     }
 
 
+def _robustness(settled: pd.DataFrame) -> dict:
+    """Amendment 5, reported only: wild cluster bootstrap p and the mean without each cluster.
+    A failure leaves the figures empty: a diagnostic must never stop a report or move a look."""
+    empty = {"wcb_p": None, "loo_min_c": None, "loo_max_c": None}
+    if settled.empty:
+        return empty
+    try:
+        g = settled.groupby("cluster", observed=True).agg(s=("pnl", "sum"), w=("qty", "sum"))
+        p = wild_cluster_p(g["s"], g["w"], PREREG.forward_boot_draws, PREREG.forward_boot_seed)
+        loo = leave_one_out(g["s"], g["w"])
+    except Exception:  # noqa: BLE001
+        log.exception("Amendment 5 figures failed; reported as n/a")
+        return empty
+    return {
+        "wcb_p": None if p is None else round(p, 5),
+        "loo_min_c": None if loo is None else round(loo[0], 3),
+        "loo_max_c": None if loo is None else round(loo[1], 3),
+    }
+
+
 def _status_text(rec: dict, st: dict, days: float) -> str:
     f = rec["final"]
     if f and f["status"] == "abandoned":
         return f"ABANDONED on {f['date']}: mean {_fmt(f['mean_c'])} c/ct on day {f['day']:.0f}"
     if f:
         word = "SUCCESS" if f["status"] == "success" else "INCONCLUSIVE"
-        return (
+        text = (
             f"{word} at look {f['look']} on {f['date']}: {f['events']} events, "
             f"{f['losing']} losing clusters, t {_fmt(f['t'])} (threshold {PREREG.forward_look_t})"
         )
+        p = f.get("wcb_p")
+        if f["status"] == "success" and p is not None and p > PREREG.forward_boot_p:
+            text += f"; not robust to the few-cluster correction (bootstrap p {p:.3f})"
+        return text
     head = f"running, day {days:.0f} of {PREREG.forward_final_day:.0f}"
     if rec["looks"]:
         lk = rec["looks"][0]
@@ -322,7 +348,7 @@ def forward_status(
         and st["t"] >= PREREG.forward_look_t
     )
     date = datetime.fromtimestamp(now_us / 1e6, timezone.utc).strftime("%Y-%m-%d")
-    entry = {"date": date, "day": round(days, 1), **st, "met": met}
+    entry = {"date": date, "day": round(days, 1), **st, "met": met, **_robustness(settled)}
     if days >= PREREG.forward_abandon_day and st["mean_c"] is not None and st["mean_c"] < 0:
         rec["final"] = {"status": "abandoned", **entry}
     elif days >= PREREG.forward_final_day:
@@ -416,6 +442,13 @@ def forward_report(data_dir: Path) -> tuple[str, str]:
             cell = cluster_table(rows, ["category", "side", "bucket"])
             cell["bucket"] = cell["bucket"].map(lambda b: bucket_label(int(b), PREREG.buckets))
             pnl = float(settled["pnl"].sum())
+            rob = _robustness(settled)
+            p = "n/a" if rob["wcb_p"] is None else f"{rob['wcb_p']:.3f}"
+            loo = (
+                "n/a"
+                if rob["loo_min_c"] is None
+                else f"{_fmt(rob['loo_min_c'], 3)} to {_fmt(rob['loo_max_c'], 3)}"
+            )
             out += [
                 f"Settled: {int(by['events'].iloc[0])} events in {int(by['clusters'].iloc[0])} "
                 f"clusters ({int(by['losing'].iloc[0])} negative), "
@@ -423,13 +456,17 @@ def forward_report(data_dir: Path) -> tuple[str, str]:
                 f"{_fmt(float(by['mean_c'].iloc[0]), 3)} cents per contract "
                 f"(t = {_fmt(float(by['t'].iloc[0]))}), PnL {pnl:.2f} USD.",
                 "",
+                f"Reported, not decisional (Amendment 5): one-sided p of the wild cluster "
+                f"bootstrap {p} ({PREREG.forward_boot_draws:,} draws, Webb weights); mean with one "
+                f"cluster left out {loo} cents per contract.",
+                "",
                 md_table(cell, {"mean_c": 3, "se_c": 3, "t": 2, "contracts": 0, "rows": 0}),
                 "",
             ]
             digest.append(
                 f"{variant}: {int(by['events'].iloc[0])} ev, "
-                f"{_fmt(float(by['mean_c'].iloc[0]), 2)} c/ct, t {_fmt(float(by['t'].iloc[0]))}, "
-                f"PnL {pnl:.2f} USD, {status}"
+                f"{_fmt(float(by['mean_c'].iloc[0]), 2)} c/ct, t {_fmt(float(by['t'].iloc[0]))} "
+                f"(bootstrap p {p}), PnL {pnl:.2f} USD, {status}"
             )
         else:
             digest.append(f"{variant}: nothing settled yet; {status}")
