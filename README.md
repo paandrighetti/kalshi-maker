@@ -157,3 +157,7 @@ Without Docker: `pip install -e .[dev]`, then `kmaker pipeline`, `kmaker paper`,
 - Glosten, L. (1994). Is the electronic open limit order book inevitable? Journal of Finance
   49(4), 1127-1161.
 - Kalshi API documentation: order direction, historical data, rate limits; Kalshi fee schedule.
+
+## License
+
+MIT. See [LICENSE](./LICENSE).
